@@ -1,0 +1,296 @@
+===============================================================
+  BIU DSI CLUSTER — SSH + VENV SETUP GUIDE
+===============================================================
+
+---------------------------------------------------------------
+1. CREATE A NEW VENV ON THE MAIN SERVER
+---------------------------------------------------------------
+
+# SSH into the main server first (from MobaXterm)
+ssh mishans1@dsihead.lnx.biu.ac.il
+
+# Navigate to your project folder
+cd /home/dsi/mishans1/projects/YOUR_PROJECT_NAME
+
+# Create the venv (using python3.9)
+python3.9 -m venv .venv
+
+# Activate it
+source .venv/bin/activate
+
+# Upgrade pip
+pip install --upgrade pip
+
+# Install your packages (example for this project)
+pip install torch==2.0.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+pip install "numpy<2"
+pip install matplotlib scipy
+
+# Deactivate when done
+deactivate
+
+
+---------------------------------------------------------------
+2. SSH FROM MAIN SERVER TO GPU SERVER (via MobaXterm)
+---------------------------------------------------------------
+
+Step 1: Open MobaXterm and connect to the main server:
+  Host: dsihead.lnx.biu.ac.il
+  Username: mishans1
+
+Step 2: From the main server, SSH to the GPU server:
+  ssh dsicsgpu08
+
+  (no password needed if SSH keys are set up between the servers)
+
+Step 3: Navigate to your project (same path — shared filesystem):
+  cd /home/dsi/mishans1/projects/YOUR_PROJECT_NAME
+
+Step 4: Activate the venv that lives on the main server:
+  source .venv/bin/activate
+
+  NOTE: Because the filesystem is shared (NFS), the venv you
+  created on the main server is directly accessible on the GPU
+  server at the same path. No copying needed.
+
+Step 5: Set CUDA environment and run:
+  export LD_LIBRARY_PATH=/usr/local/cuda-12.3/targets/x86_64-linux/lib:$LD_LIBRARY_PATH
+  CUDA_VISIBLE_DEVICES=1 .venv/bin/python main.py
+
+
+---------------------------------------------------------------
+3. CHOOSING WHICH GPU TO USE
+---------------------------------------------------------------
+
+# Check GPU availability before running
+nvidia-smi
+
+# Output shows GPU index, utilization %, and memory usage
+# Pick a GPU with 0% utilization and low memory usage
+
+# Run on a specific GPU (e.g. GPU 1)
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python main.py
+
+# Run on multiple GPUs
+CUDA_VISIBLE_DEVICES=1,2 .venv/bin/python main.py
+
+# Run on CPU only (no GPU)
+CUDA_VISIBLE_DEVICES="" .venv/bin/python main.py
+
+
+---------------------------------------------------------------
+4. PERSISTENT ENVIRONMENT SETUP (add to ~/.bashrc)
+---------------------------------------------------------------
+
+# So you don't need to export manually every session:
+echo 'export LD_LIBRARY_PATH=/usr/local/cuda-12.3/targets/x86_64-linux/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+
+
+---------------------------------------------------------------
+5. QUICK ONE-LINER: RUN ON GPU SERVER FROM MAIN SERVER
+---------------------------------------------------------------
+
+# Without SSHing manually — run directly from main server:
+ssh dsicsgpu08 "cd /home/dsi/mishans1/projects/YOUR_PROJECT_NAME && \
+  export LD_LIBRARY_PATH=/usr/local/cuda-12.3/targets/x86_64-linux/lib:$LD_LIBRARY_PATH && \
+  CUDA_VISIBLE_DEVICES=1 .venv/bin/python main.py"
+
+
+---------------------------------------------------------------
+6. RUN IN BACKGROUND (so closing MobaXterm doesn't kill it)
+---------------------------------------------------------------
+
+# Use nohup to keep the process running after disconnect
+nohup CUDA_VISIBLE_DEVICES=1 .venv/bin/python main.py > output.log 2>&1 &
+
+# The & sends it to background, output goes to output.log
+# Check progress anytime with:
+tail -f output.log
+
+# Find the process later
+ps aux | grep main.py
+
+# Kill it if needed
+kill PID_NUMBER
+
+
+---------------------------------------------------------------
+7. KNOWN ISSUES & FIXES
+---------------------------------------------------------------
+
+ISSUE: torch hangs on _preload_cuda_deps / libnvrtc
+FIX:   export LD_LIBRARY_PATH=/usr/local/cuda-12.3/targets/x86_64-linux/lib:$LD_LIBRARY_PATH
+
+ISSUE: "NVIDIA GeForce GTX 1080 Ti is not compatible" (sm_61)
+FIX:   pip install torch==2.0.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+       (PyTorch 2.1+ dropped support for sm_61 / GTX 1080 Ti)
+
+ISSUE: "NumPy 2.x not compatible" / Numpy is not available
+FIX:   pip install "numpy<2"
+
+ISSUE: No display / GUI crashes on server (tkinter/matplotlib)
+FIX:   Use matplotlib backend Agg (no display needed):
+       Add this at the top of your script before importing pyplot:
+         import matplotlib
+         matplotlib.use('Agg')
+       Then save figures with plt.savefig() instead of plt.show()
+
+
+---------------------------------------------------------------
+8. USEFUL COMMANDS
+---------------------------------------------------------------
+
+# Check which python/venv is active
+which python
+
+# Check installed packages
+pip list
+
+# Check PyTorch version and CUDA
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
+
+# Check GPU memory in real time
+watch -n 1 nvidia-smi
+
+# Check available disk space
+df -h ~
+
+# Copy files from main server to GPU server (if needed)
+scp file.py dsicsgpu08:/home/dsi/mishans1/projects/YOUR_PROJECT/
+
+---------------------------------------------------------------
+9. GIT SETUP — CONNECT SERVER TO GITHUB
+---------------------------------------------------------------
+
+RECOMMENDED METHOD: SSH Key (no password typing every push/pull)
+
+--- Step 1: Generate an SSH key on the server ---
+
+ssh-keygen -t ed25519 -C "your_email@example.com"
+
+  - Press Enter to accept default path (~/.ssh/id_ed25519)
+  - Set a passphrase or leave empty (Enter for no passphrase)
+
+--- Step 2: Copy the public key ---
+
+cat ~/.ssh/id_ed25519.pub
+
+  Copy the entire output (starts with "ssh-ed25519 ...")
+
+--- Step 3: Add the key to GitHub ---
+
+  1. Go to https://github.com/settings/keys
+  2. Click "New SSH key"
+  3. Title: e.g. "BIU DSI Server"
+  4. Paste the key → click "Add SSH key"
+
+--- Step 4: Test the connection ---
+
+ssh -T git@github.com
+
+  Expected response:
+  "Hi YOUR_USERNAME! You've successfully authenticated..."
+
+--- Step 5: Configure git identity ---
+
+git config --global user.name "Your Name"
+git config --global user.email "your_email@example.com"
+
+
+---------------------------------------------------------------
+10. BASIC GIT WORKFLOW ON THE SERVER
+---------------------------------------------------------------
+
+# Clone a repo from GitHub (use SSH URL, not HTTPS)
+git clone git@github.com:YOUR_USERNAME/YOUR_REPO.git
+
+# Pull latest changes
+git pull
+
+# Check status of changed files
+git status
+
+# Stage all changes
+git add .
+
+# Stage specific file
+git add main.py
+
+# Commit
+git commit -m "your message"
+
+# Push to GitHub
+git push
+
+# Push for the first time (set upstream)
+git push -u origin main
+
+
+---------------------------------------------------------------
+11. USEFUL GIT COMMANDS
+---------------------------------------------------------------
+
+# See commit history
+git log --oneline
+
+# See what changed in a file
+git diff main.py
+
+# Undo unstaged changes in a file
+git checkout -- main.py
+
+# Create and switch to a new branch
+git checkout -b new-branch-name
+
+# Switch branch
+git checkout main
+
+# Stash uncommitted changes temporarily
+git stash
+git stash pop   # restore them
+
+# Pull and overwrite local changes (careful!)
+git fetch origin
+git reset --hard origin/main
+
+
+---------------------------------------------------------------
+12. .GITIGNORE — WHAT TO EXCLUDE FROM GIT
+---------------------------------------------------------------
+
+# Create a .gitignore in your project root:
+cat > .gitignore << 'EOF'
+# Python venv
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Training outputs
+*.pt
+*.pth
+*.log
+output.log
+
+# Parameters file (auto-generated)
+parameters.txt
+
+# Matplotlib figures
+*.png
+*.pdf
+
+# OS files
+.DS_Store
+EOF
+
+
+NOTE: The .venv folder should NEVER be pushed to GitHub.
+      It contains compiled binaries specific to the server.
+      Always recreate it with pip install after cloning.
+
+===============================================================
+END OF GUIDE
+===============================================================
