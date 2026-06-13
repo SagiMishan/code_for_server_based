@@ -2,391 +2,337 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.io import loadmat
-from torch import matmul, sqrt, tensor
-from torch import t as transpose
-from scipy.io import savemat
-import scipy.io
+from torch import tensor
+
+from Network_single_channel import Network_single_channel
 
 
-def save_var_with_name(var, name, prefix=''):
-    """
-    Save a variable (list, dict, or scalar/array) to .mat files.
-    """
-    def _to_saveable(v):
-        if isinstance(v, torch.Tensor):
-            return v.detach().cpu().numpy()
-        return v
-
-    if isinstance(var, list):
-        for idx, elem in enumerate(var):
-            new_name = f"{name}_{idx}"
-            save_var_with_name(elem, new_name, prefix)
-    elif isinstance(var, dict):
-        filename = f"{prefix}{name}.mat"
-        mdict = {str(k): _to_saveable(v) for k, v in var.items()}
-        scipy.io.savemat(filename, mdict)
-    else:
-        filename = f"{prefix}{name}.mat"
-        scipy.io.savemat(filename, {name: _to_saveable(var)})
+def print_grad_sum_weight_decay(model, skip_list=["User_w", "User_b"]):
+    sum = 0
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if not name.split(".")[-1] in skip_list:
+            print(name + "  grad : {:.5f} , weight : {:.5f}".format(param.grad.norm(2).item(), param.norm(2).item()))
+            sum += param.grad.norm(2).item()
+    print(sum)
 
 
 def dB2lin(x):
-    return torch.pow(10, torch.tensor(x) / 10)
+    if not torch.is_tensor(x):
+        x = tensor(x)
+    return torch.pow(10, x / 10)
 
-def rapp(A, A0=1, p=3):
-    A_mag = torch.abs(A)
-    mag = A_mag / (1 + ((A_mag / A0) ** 2) ** p) ** (1 / (2 * p))
-    return mag * A / (A_mag + 1e-9)
-# Define the full neural network
-class Network_single_channel(nn.Module):
-    def __init__(self, connectaionMatrix, N_relays, MatcgRR, MatcgSR, MatcgRU, MatcgTU, modCode_order, N_rx,N_tx,useless_relays,
-                 demod_type="simple"):
-        """
-        gain_matrices: List of gain matrices, one for each layer
-        """
-        super(Network_single_channel, self).__init__()
-        self._device = MatcgRR.device
+
+class Network_multy_channel(nn.Module):
+    def __init__(self, N_users, N_channels, N_relays, connectaionMatrix, MatcgRR, MatcgSR, MatcgRU, MatcgTU,
+                 modCode_order, N_rx, N_tx, demod_type="simple"):
+        super(Network_multy_channel, self).__init__()
         self.connectaionMatrix = connectaionMatrix
-        self.HierarchyLayers = self.NetworkHierarchyLayers(connectaionMatrix)
-        self.N_layers = len(self.HierarchyLayers)
-        # print(self.HierarchyLayers)
-
-        self.modCode_order = modCode_order
+        self.N_relays = N_relays
+        self.N_users = N_users
+        self.N_channels = N_channels
         self.N_rx = N_rx
         self.N_tx = N_tx
-        self.register_buffer('modulation', tensor(
-            loadmat("./modulation/QAM_{}.mat".format(self.modCode_order))["modulation"][0], dtype=torch.complex64))
+
+        self.modCode_order = modCode_order
+
         self.demod_type = demod_type
 
-        self.N_users = int( MatcgRU.shape[1] / self.N_rx)
-        self.N_relays = N_relays
-
-        self.cgRR = self.ChannelGainRelay2Relay(MatcgRR)
-        self.cgSR = self.ChannelGainSource2Relay(MatcgSR)
-        self.cgRU = self.ChannelGainRelay2User(MatcgRU)
+        self.MatcgRR = MatcgRR
+        self.MatcgSR = MatcgSR
+        self.MatcgRU = MatcgRU
         self.MatcgTU = MatcgTU
 
-        self.transmitNN = TransmitorNN(N_users = self.N_users,N_tx=N_tx)
+        useless_per_channel = self.remove_globally_useless_relays()
 
-        w = self.randomComplexNormal((self.N_relays, 1), sigma=0.1)
-        w[list(useless_relays)] = torch.tensor(0,dtype=torch.complex64)
-        self.w = nn.Parameter(w)
+        self.sub_networks = nn.ModuleList([Network_single_channel(connectaionMatrix=self.connectaionMatrix[idx],
+                                                                  N_relays=N_relays,
+                                                                  MatcgSR=self.MatcgSR[idx].T,
+                                                                  MatcgRR=self.MatcgRR[idx],
+                                                                  MatcgRU=self.MatcgRU[idx],
+                                                                  MatcgTU=self.MatcgTU[idx],
+                                                                  modCode_order=self.modCode_order[idx],
+                                                                  N_rx=self.N_rx,
+                                                                  N_tx = self.N_tx,
+                                                                  demod_type=self.demod_type,
+                                                                  useless_relays = useless_per_channel[idx]) for idx in
+                                           range(self.N_channels)])
+        self.N_layers = [self.sub_networks[c].N_layers for c in range(self.N_channels)]
+        self.P = [torch.ones((self.N_relays, 1)) for c in range(self.N_channels)]
 
-        b = self.randomComplexNormal((self.N_relays, 1), sigma=0.1)
-        b[list(useless_relays)] = torch.tensor(0,dtype=torch.complex64)
-        self.b = nn.Parameter(b)
+    def find_useless_single_channel(self, conn, cgRU):
+        N_relays = self.N_relays  # exclude last row/col (TX)
 
-        self.V = torch.ones((self.N_relays, 1))
-        self.BN = [ComplexBatchNorm1d(num_of_dim=self.HierarchyLayers[i].size(0)) for i in range(1, self.N_layers)]
+        # Work only on the relay-to-relay submatrix (exclude TX row and col)
+        conn_relays = conn[:N_relays, :N_relays]  # shape (N_relays, N_relays)
+        cgRU_relays = cgRU[:N_relays]  # shape (N_relays, N_users*N_rx)
 
-        self.User_w = nn.Parameter(self.randomComplexNormal((self.N_users , 1), sigma=0.1))
-        self.User_b = nn.Parameter(self.randomComplexNormal((self.N_users , 1), sigma=0.1))
-        self.User_BN = ComplexBatchNorm1d(num_of_dim=self.N_users * self.N_rx)
+        # Step 1: relays that directly connect to a receiver
+        reachable = cgRU_relays.abs().sum(dim=1) > 0  # (N_relays,)
 
+        # Step 2: backward propagation through relay-only connection matrix
+        changed = True
+        while changed:
+            can_reach = (conn_relays * reachable.unsqueeze(0)).sum(dim=1) > 0
+            new_reachable = reachable | can_reach
+            changed = not torch.equal(new_reachable, reachable)
+            reachable = new_reachable
 
-        self.reciverNN = nn.ModuleList(ReciverNN(N_rx=N_rx) for _ in range(self.N_users))
+        return set(torch.where(~reachable)[0].tolist())
 
-
-        self.SNR = 1  # in linear form
-
-        self._init_args = {
-            "N_relays": N_relays,
-            "connectaionMatrix": connectaionMatrix,
-            "MatcgRR": MatcgRR,
-            "MatcgSR": MatcgSR,
-            "MatcgRU": MatcgRU,
-            "modCode_order": modCode_order,
-            "demod_type": demod_type,
-
-        }
-        self.BN_args = {
-            "BN": [bn._get_init_arges() for bn in self.BN],
-            "BN_user": self.User_BN._get_init_arges()
-        }
-
-        self._numBits_ = int(self.modCode_order - 1).bit_length()
-        self.register_buffer('_bits_mask_', 2 ** torch.arange(self._numBits_ - 1, -1, -1))
-
-    def _apply(self, fn):
-        super()._apply(fn)
-        self._device = self.w.device
-        self.HierarchyLayers = [fn(t) for t in self.HierarchyLayers]
-        self.cgRR = [[fn(t) for t in gain] for gain in self.cgRR]
-        self.cgSR = [fn(t) for t in self.cgSR]
-        self.cgRU = [fn(t) for t in self.cgRU]
-        self.MatcgTU = fn(self.MatcgTU)
-        return self
-
-    def forward(self, s,bits):
-        batch_size = bits.shape[1]
-        if self.demod_type == "complex":
-
-            x = self.transmitNN(bits.to(torch.complex64).T).T
-        else:
-            x = torch.unsqueeze(s,dim=0)
-        r = torch.zeros((self.N_users * self.N_rx, batch_size), dtype=torch.complex64, device=self._device)
-        layer_output = []
-        for currentIndex, currentLayer in enumerate(self.HierarchyLayers[1:]):
-            y = torch.zeros((currentLayer.shape[0], batch_size), dtype=torch.complex64, device=self._device)
-            y = y + self.cgSR[currentIndex].T @ x
-
-            for prev_index, prevLayer in enumerate(self.HierarchyLayers[1:currentIndex + 1]):
-                y = y + self.cgRR[currentIndex - 1][prev_index] @ layer_output[prev_index]
-            y = y + self.randomComplexNormal(y.shape, 1 / self.SNR)
-            y = self.BN[currentIndex](y, self.training)
-
-            oil = rapp(y * self.w[currentLayer] + self.b[currentLayer]).type(torch.complex64)
-
-            layer_output.append(oil)
-
-        for currentIndex, currentLayer in enumerate(self.HierarchyLayers[1:]):
-            r = r + (transpose(self.cgRU[currentIndex]) @ layer_output[currentIndex]).squeeze()
-        r = r + self.MatcgTU.T @ x + self.randomComplexNormal(r.shape, 1 / self.SNR)
-        # r = self.User_BN(r, self.training).reshape((self.N_users, self.N_rx,batch_size)).sum(dim=1)
-        # r = r * self.User_w + self.User_b
-        r = self.User_BN(r, self.training).reshape((self.N_users, self.N_rx,batch_size))
-        if self.demod_type == "complex":
-            r = torch.cat( [self.reciverNN[m](r[m,:,:].T).T for m in range(self.N_users)],dim=0)
-
-        return r
-
-    def NetworkHierarchyLayers(self, connectionMatrix):
-        matrix = connectionMatrix
-        Layers = []
-        indexes = torch.arange(matrix.shape[0])
-        source_index = max(indexes)
-        while not matrix.shape[0] <= 1:
-            # check the number of connection to the next layer
-            numOfConnections = torch.sum(matrix, axis=1)
-            # if it is zero it means you are a leaf and that is a layer
-            leafs = torch.where(numOfConnections == 0)[0]
-            if source_index in indexes[leafs]:
-                print("source have source :(" + "-" * 20)
-                continue
-
-            # save the leafs index
-            Layers.append(indexes[leafs])
-            # remove leaves from the matrix
-            mask = torch.ones(matrix.shape[0], dtype=torch.bool)
-            mask[leafs] = False
-            matrix = matrix[mask][:, mask]
-
-            # Update the indexes
-            indexes = indexes[mask]
-        Layers.append(indexes)
-        # Layers.append([source_index])
-        Layers.reverse()
-
-        # for idx, layer in enumerate(Layers):
-        #     plt.scatter(idx * torch.ones(layer.shape), layer)
-        # plt.show()
-
-        return Layers
-
-    def ChannelGainRelay2Relay(self, MatcgRR):
-        cgRR = []
-        for currentIndex, currentLayer in enumerate(self.HierarchyLayers[2:]):
-            gain = []
-            for prev_index, prevLayer in enumerate(self.HierarchyLayers[1:(currentIndex + 2)]):
-                gain.append(MatcgRR[np.ix_(prevLayer, currentLayer)].T)
-            cgRR.append(gain)
-        return cgRR
-
-    def ChannelGainRelay2User(self, MatcgRU):
-        cgRU = []
-        for currentIndex, currentLayer in enumerate(self.HierarchyLayers[1:]):
-            cgRU.append(MatcgRU[currentLayer, :].type(torch.complex64))
-        return cgRU
-
-    def ChannelGainSource2Relay(self, MatSR):
-        cgSR = []
-        for currentIndex, currentLayer in enumerate(self.HierarchyLayers[1:]):
-            cgSR.append(MatSR[:,currentLayer])
-        return cgSR
-
-    def randomComplexNormal(self, shape, sigma=1.0, mu=0.0):
-        if torch.is_tensor(sigma):
-            sigma = sigma.to(self._device)
-        return sigma * torch.randn(size=shape, dtype=torch.complex64, device=self._device) + mu
-
-    def modulator(self, batch_size):
-        # symbols = torch.randint(0, self.modCode_order, (batch_size,))
-        # bits = self.symbols_to_bits(symbols)
-
-        bits = torch.rand(self.N_users, batch_size, device=self._device) > 0.5
-        symbols = torch.sum(torch.unsqueeze(self._bits_mask_, dim=1) * bits, dim=0)
-        rm = self.modulation[symbols.to(torch.int32)]
-        return rm, bits
-
-    def symbols_to_bits(self, symbols):
+    def remove_globally_useless_relays(self):
         """
-        Convert integer modulation symbols to their binary bit representation.
-
-        Each input symbol is assumed to be an integer in the range
-        ``[0, self.modCode_order - 1]`` and is expanded into a fixed-length
-        binary vector with one row per symbol. The number of bits per symbol
-        is determined from ``self.modCode_order`` as
-        ``num_bits = ceil(log2(self.modCode_order))``.[web:109][web:118]
-
-        The bits are ordered from most-significant bit (MSB) to least-significant
-        bit (LSB) and concatenated into a 1D tensor:
-        ``[sym0_bit0, sym0_bit1, ..., sym0_bit{num_bits-1},
-           sym1_bit0, ..., sym1_bit{num_bits-1}, ...]``.
-
-        Args:
-            symbols (Tensor): 1D integer tensor of shape ``(N,)`` containing
-                modulation symbol indices on any device supported by PyTorch.[web:101]
-
-        Returns:
-            Tensor: 1D integer tensor of shape ``(N * numBits,)`` containing
-            the concatenated bits (values 0 or 1) corresponding to the input
-            symbols.
-
+        Remove relays that are useless in ALL channels simultaneously.
+        Works purely on raw matrices, before sub-networks are built.
+        A relay is useless in a channel if it cannot reach any receiver,
+        directly or through other relays.
+        connectionMatrix[c] shape: (N_relays, N_relays)
+        MatcgRU[c]          shape: (N_relays, N_users*N_rx)
         """
 
-        bits = (symbols.unsqueeze(-1) & self._bits_mask_) > 0
-        bits = bits.int()
-        return torch.reshape(bits, (-1,))
+        # Find useless relays per channel
+        useless_per_channel = [
+            self.find_useless_single_channel(self.connectaionMatrix[c], self.MatcgRU[c])
+            for c in range(self.N_channels)
+        ]
 
+        # Remove only relays that are useless in ALL channels
+        globally_useless = set.intersection(*useless_per_channel)
+        globally_useful = sorted(set(range(self.N_relays)) - globally_useless)
+        useful_mask = torch.tensor(globally_useful)
+        for c in range(self.N_channels):
+            print(f"for channel {c} the useless relays are : {sorted(useless_per_channel[c])}")
+        print(f"Removing {len(globally_useless)} globally useless relays: {sorted(globally_useless)}")
+        print(f"Keeping {len(globally_useful)} relays.")
 
-    def demodulator(self, rm):
-        return torch.real(rm)
+        # # Prune all matrices
+        # new_connectaionMatrix = [
+        #     torch.cat([
+        #         torch.cat([self.connectaionMatrix[c][:self.N_relays, :self.N_relays][useful_mask][:, useful_mask],
+        #                    # relay block
+        #                    self.connectaionMatrix[c][:self.N_relays, -1:][useful_mask]], dim=1),  # TX col
+        #         self.connectaionMatrix[c][-1:, :][:, torch.cat([useful_mask, torch.tensor([self.N_relays])])]  # TX row
+        #     ], dim=0)
+        #     for c in range(self.N_channels)
+        # ]
+        # new_MatcgRU = [self.MatcgRU[c][useful_mask, :] for c in range(self.N_channels)]
+        # new_MatcgSR = [self.MatcgSR[c][:, useful_mask] for c in range(self.N_channels)]
+        # new_MatcgRR = [self.MatcgRR[c][:, useful_mask][useful_mask, :] for c in range(self.N_channels)]
+        #
+        # # Update self variables
+        # self.N_relays = len(globally_useful)
+        # self.MatcgRU = new_MatcgRU
+        # self.MatcgSR = new_MatcgSR
+        # self.MatcgRR = new_MatcgRR
+        # self.connectaionMatrix = new_connectaionMatrix
+        return useless_per_channel
 
-    def sum_v(self):
-        return sum(self.V)
+    def train_single_channel(self, num_itr, model_idx, loss_fn, optimizer, device, stage3=False, batch=100, SNR=1e-3):
+        self.sub_networks[model_idx].SNR = dB2lin(SNR)
+        self.sub_networks[model_idx].train()
+        optimizer.zero_grad()
+        BER = np.zeros((int(num_itr / 100), 1))
+        runnig_loss = np.zeros((int(num_itr / 100), 1))
+        if stage3:
+            self.set_weights()
+        for itr in range(num_itr):
+            signal ,bits = self.sub_networks[model_idx].modulator(batch)
+            # Compute prediction error
+            rm = self.sub_networks[model_idx](signal ,bits)
+            pred = self.sub_networks[model_idx].demodulator(rm)
+
+            loss = loss_fn(torch.reshape(pred, (-1,)), torch.reshape(bits.to(torch.int32) * 2 - 1, (-1,)))
+            loss.backward()
+
+            optimizer.step()
+            optimizer.zero_grad()
+            # if stage3:
+            #     self.set_weights()
+            if itr % 100 == 0:
+                loss = loss.item()
+                runnig_loss[int(itr / 100)] = loss
+                worst_BER, avrage_BER, best_BER = self.sub_networks[model_idx].BER(bits=bits, pred=pred)
+                BER[int(itr / 100)] = worst_BER
+                print("channel {} -- loss: {:.5f} , BER : {:.5f}".format(model_idx, loss, BER[int(itr / 100)][0]))
+        return BER, runnig_loss
+
+    def test_single_channel(self, model_idx, loss_fn, batch=100, SNR=torch.tensor(-5), device=None, ToPrint=True):
+        self.sub_networks[model_idx].eval()
+        test_loss, BER = torch.zeros(SNR.shape), torch.zeros(SNR.shape)
+        with torch.no_grad():
+            for snr_idx, snr in enumerate(SNR):
+                self.sub_networks[model_idx].SNR = dB2lin(snr)
+                signal, bits = self.sub_networks[model_idx].modulator(batch)
+                # Compute prediction error
+                rm = self.sub_networks[model_idx](signal,bits)
+                pred = self.sub_networks[model_idx].demodulator(rm)
+                # print(f"{signal.shape=}, {bits.shape=}, {rm.shape=}, {pred.shape=}")
+                if loss_fn != None:
+                    test_loss += loss_fn(pred, bits * 2 - 1).item()
+                worst_BER, avrage_BER, best_BER = self.sub_networks[model_idx].BER(bits=bits, pred=pred)
+                BER[snr_idx] = worst_BER
+                test_loss[snr_idx] /= bits.shape[0]
+
+        if ToPrint:
+            for snr_idx, snr in enumerate(SNR):
+                print("channel {} -- for SNR = {} , loss: {:.5f} , BER : {:.5f}".format(model_idx, snr,
+                                                                                        test_loss[snr_idx],
+                                                                                        BER[snr_idx]))
+        return BER, test_loss
 
     def update_v(self):
-        lambda_w = 1
-        lambda_b = 1
-        # clamp prevents norm gradient exploding to NaN at exactly zero
-        w_norm = self.w.norm(2, dim=1, keepdim=True).clamp(min=1e-8)
-        b_norm = self.b.norm(2, dim=1, keepdim=True).clamp(min=1e-8)
-        self.V = torch.clamp(1 - torch.exp(-lambda_w * w_norm - lambda_b * b_norm),max=1-1e-8,min=1e-8)
+        for idx in range(self.N_channels):
+            self.sub_networks[idx].update_v()
 
-    def BER(self, bits, pred):
-        pred = pred > 0
-        corrct_or_not = pred != bits
-        avrage_BER = corrct_or_not.sum() / (corrct_or_not.shape[0]*corrct_or_not.shape[1])
-        BER_per_user = corrct_or_not.sum(dim=1) / corrct_or_not.shape[1]
-        best_BER = min(BER_per_user)
-        worst_BER = max(BER_per_user)
-        return worst_BER, avrage_BER, best_BER
+    def learn_score(self):
+        self.update_v()
+        relay_v_sum = torch.zeros((self.N_relays, 1))
+        relay_v_max = -torch.ones((self.N_relays, 1))
+        score = 0
+        C = self.N_channels
+        for c in range(self.N_channels):
+            relay_v_sum = relay_v_sum + self.sub_networks[c].V
+            relay_v_max = torch.maximum(relay_v_max, self.sub_networks[c].V)
+        relay_v_sum = torch.maximum(relay_v_sum, tensor(1e-6))
+        relay_v_max = torch.maximum(relay_v_max, tensor(1e-6))
+        score = score + torch.sum(C / (C - 1) * relay_v_max / relay_v_sum - 1 / (C - 1))
+        return score / self.N_relays
 
-    def update_init_arges(self):
+    def sum_v(self):
+        sum_v = tensor(0)
+        for idx in range(self.N_channels):
+            self.sub_networks[idx].update_v()
+            sum_v = sum_v + self.sub_networks[idx].sum_v()
+        return sum_v
 
-        self.BN_args = {
-            "BN": [bn._get_init_arges() for bn in self.BN],
-            "BN_user": self.User_BN._get_init_arges()
-        }
+    def culc_p(self):
+        self.update_v()
+        # Stack all V tensors into a single [N_channels, N_relays, 1] tensor —
+        # sum and assignment become single tensor ops, no Python loops.
+        V_stack = torch.stack([self.sub_networks[c].V for c in range(self.N_channels)], dim=0)  # [C, N, 1]
+        relay_v_sum = V_stack.sum(dim=0, keepdim=True).clamp(min=1e-6)  # [1, N, 1]
+        P_stack = V_stack / relay_v_sum  # [C, N, 1]
+        for c in range(self.N_channels):
+            self.P[c] = P_stack[c]
 
-    def save_python(self, path, Name):
-        self.update_init_arges()
-        torch.save(
-            {
-                "init_args": self._init_args,
-                "BN_args": self.BN_args,
-                "state_dict": self.state_dict()
-            },
-            os.path.join(path, "models", "python", Name)
-        )
+    def drop_weights(self, z0=0.1):
+        p_r = torch.stack([self.P[c].detach().squeeze() for c in range(self.N_channels)])
 
-    def save_dict_to_npz(self, tensor_dict, save_path):
-        # If tensors, convert to numpy arrays
-        converted = {k: v.detach().cpu().numpy() if hasattr(v, 'detach') else v for k, v in tensor_dict.items()}
-        savemat(save_path, converted)
+        bias_probability = (torch.rand(self.N_relays) <= z0).unsqueeze(0).expand_as(p_r)
 
-    def save_matlab(self, path, Name):
-        self.update_init_arges()
-        save_var_with_name(self.BN_args, Name + "BN_args", os.path.join(path, "models", "matlab", Name + "BN_args"))
-        save_var_with_name(self.state_dict(), Name + "state_dict", os.path.join(path, "models", "matlab", Name + "state_dict"))
+        # True  → zero out,  False → keep
+        to_zero_out = p_r <= torch.rand(p_r.shape)
+        # Always keep the best channel for every relay
+        to_zero_out[torch.argmax(p_r, dim=0), torch.arange(p_r.shape[1])] = False
+        # Only zero out where both the random draw AND the bias gate say so
+        # (to_zero_out AND bias_probability) → zero;  negate → keep mask
+        keep_mask = ~(to_zero_out & bias_probability)  # [C, N]
 
-        # self.save_dict_to_npz(self._init_args, os.path.join(path, "models", "matlab", Name + "_init_arges.mat"))
-        # self.save_dict_to_npz(self.BN_args, os.path.join(path, "models", "matlab", Name + "BN_args.mat"))
-        # self.save_dict_to_npz(self.state_dict(), os.path.join(path, "models", "matlab", Name + "state_dict.mat"))
+        n_dropped = (~keep_mask).sum().item()
+        if n_dropped > 0:
+            for c in range(self.N_channels):
+                mask = keep_mask[c].unsqueeze(1)  # [N, 1]
+                self.sub_networks[c].w.data.mul_(mask)
+                self.sub_networks[c].b.data.mul_(mask)
 
-    def load(self, path, Name, device=None):
-        checkpoint = torch.load(os.path.join(path, "models", "python", Name), map_location=device, weights_only=False)
-        self.load_state_dict(checkpoint["state_dict"])
-        dev = self.w.device
-        BN_arc = checkpoint["BN_args"]["BN"]
+        return n_dropped
 
-        for idx, bn in enumerate(self.BN):
-            self.BN[idx].mean = torch.tensor(BN_arc[idx]["mean"], dtype=torch.complex64).to(dev)
-            self.BN[idx].var = torch.tensor(BN_arc[idx]["var"], dtype=torch.complex64).to(dev)
-        BN_user_arc = checkpoint["BN_args"]["BN_user"]
-        self.User_BN.mean = torch.tensor(BN_user_arc["mean"], dtype=torch.complex64).to(dev)
-        self.User_BN.var = torch.tensor(BN_user_arc["var"], dtype=torch.complex64).to(dev)
+    def set_weights(self):
+        # Build p_r in one shot
+        p_r = torch.stack([self.P[c].detach().squeeze() for c in range(self.N_channels)])  # [C, N]
+
+        winner = torch.zeros_like(p_r)
+        winner[torch.argmax(p_r, dim=0), torch.arange(p_r.shape[1])] = 1.0
+
+        for c in range(self.N_channels):
+            mask = winner[c].unsqueeze(1).bool()  # [N, 1]
+
+            self.sub_networks[c].w.data.mul_(mask)
+            self.sub_networks[c].b.data.mul_(mask)
+
+            # FIX: remove any previously registered hooks before adding new ones,
+            # otherwise hooks stack up and multiply the gradient by mask^N.
+            if hasattr(self.sub_networks[c], '_mask_hook_handles'):
+                for handle in self.sub_networks[c]._mask_hook_handles:
+                    handle.remove()
+
+            h_w = self.sub_networks[c].w.register_hook(self.mask_hook(mask))
+            h_b = self.sub_networks[c].b.register_hook(self.mask_hook(mask))
+            self.sub_networks[c]._mask_hook_handles = [h_w, h_b]
+
+    def mask_hook(self, mask):
+        def hook(grad):
+            return grad * mask.float()
+
+        return hook
+
+    def selective_gradient(self, tensor, mask):
+
+        if tensor.shape != mask.shape:
+            raise ValueError(f"Shape mismatch: tensor shape {tensor.shape}, mask shape {mask.shape}")
+
+        with torch.no_grad():
+            # Clone tensor to preserve original
+            result = tensor.clone()
+            # Detach and zero out the parts where mask is False
+            result[~mask] = result[~mask].detach()
+        return result
+
+    def mask_grad(self):
+        for r in range(self.N_relays):
+            p_r = torch.zeros((self.N_channels, 1))
+            for c in range(self.N_channels):
+                p_r[c, :] = self.P[c][r]
+
+            not_to_zero_or_to_zero = torch.zeros(p_r.shape)
+            not_to_zero_or_to_zero[torch.argmax(p_r, dim=0), torch.arange(p_r.shape[1])] = 1
+            for c in range(self.N_channels):
+                mask = torch.unsqueeze(not_to_zero_or_to_zero[c, :], 1).to(torch.bool)
+                if self.sub_networks[c].w[r].grad is not None:
+                    self.sub_networks[c].w[r].grad *= mask
+                if self.sub_networks[c].b[r].grad is not None:
+                    self.sub_networks[c].b[r].grad *= mask
+
+    def save(self, path, Name):
+        for c in range(self.N_channels):
+            self.sub_networks[c].save_python(path, Name + f"c{c}")
+            self.sub_networks[c].save_matlab(path, Name + f"c{c}")
+
+    def load(self, path, Name):
+        for c in range(self.N_channels):
+            self.sub_networks[c].load(path, Name + f"c{c}")
 
 
-class ComplexBatchNorm1d:
-    def __init__(self, num_of_dim, init_mean=0, init_var=1, momentum=0.1, eps=1e-5):
-        self.mean = init_mean * torch.ones((num_of_dim, 1), dtype=torch.complex64, requires_grad=False)
-        self.var = init_var * torch.ones((num_of_dim, 1), dtype=torch.complex64, requires_grad=False)
-        self.momentum = momentum
-        self.eps = eps
 
-    def __call__(self, y, state):
-        self.mean = self.mean.to(y.device)
-        self.var = self.var.to(y.device)
-        if state:  # in train
-            with torch.no_grad():
-                batch_mean = torch.mean(y, dim=1, keepdim=True)
-                batch_var = torch.sqrt(torch.var(y, dim=1, keepdim=True).real.clamp(min=1e-6)).to(torch.complex64)
-                m = self.momentum
-                self.mean = (1 - m) * self.mean + m * batch_mean
-                self.var = (1 - m) * self.var + m * batch_var
-        return (y - self.mean) / (self.var + self.eps)
-
-    def _get_init_arges(self):
-        return {"mean": self.mean.detach().cpu().numpy(), "var": self.var.detach().cpu().numpy()}
-
-class ReciverNN(nn.Module):
-    def __init__(self, N_rx, K=1, hidden_dims=None):
-        super().__init__()
-        if hidden_dims is None:
-            hidden_dims = [2*N_rx, 4*N_rx*K, 2*K]
-
-        dims = [N_rx] + hidden_dims
-        layers = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1],dtype=torch.complex64))
-        layers.append(nn.Linear(dims[-1], K,dtype=torch.complex64))
-
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.net(x)
-        return x
-
-
-    def num_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-
-class TransmitorNN(nn.Module):
-    def __init__(self, N_users, N_tx, hidden_dims=None, use_bn=True, dropout=0.0):
-        super().__init__()
-        if hidden_dims is None:
-            hidden_dims = [2*N_users, 4*N_users*N_tx, 2*N_tx]
-
-        dims = [N_users] + hidden_dims
-        layers = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1],dtype=torch.complex64))
-            layers.append(nn.Tanh())
-        layers.append(nn.Linear(dims[-1], N_tx,dtype=torch.complex64))
-
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.net(x)
-        # return self.complex_tanh( x)
-        return rapp(x)
-    # def complex_tanh(self,x):
-    #     magnitude = x.abs().clamp(min=1e-8)
-    #     scale = torch.tanh(magnitude) / magnitude
-    #     return x * scale
-
-    def num_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+def load_model(path, stage = None):
+    def _pt(name):
+        return torch.load(os.path.join(path, 'data', name + '.pt'), weights_only=True)
+    MatcgRR           = _pt('MatcgRR')
+    MatcgSR           = _pt('MatcgSR')
+    cgRU              = _pt('cgRU')
+    connectaionMatrix = _pt('connectaionMatrix')
+    N_users           = _pt('N_users')
+    N_channels        = int(_pt('N_channels'))
+    N_relays          = int(_pt('N_relays'))
+    demod_type        = _pt('demod_type')
+    N_rx             = _pt('N_rx')
+    N_tx            = _pt('N_tx')
+    cgTU             = _pt('cgTU')
+    modCode_order     = [2 ** int(n) for n in N_users]
+    model = Network_multy_channel(N_users=N_users,
+                                  N_relays=N_relays,
+                                  N_channels=N_channels,
+                                  connectaionMatrix=connectaionMatrix,
+                                  MatcgSR=MatcgSR,
+                                  MatcgRR=MatcgRR,
+                                  MatcgRU=cgRU,
+                                  MatcgTU=cgTU,
+                                  modCode_order=modCode_order,
+                                  demod_type=demod_type,
+                                  N_rx=N_rx,
+                                  N_tx=N_tx
+                                  )
+    if not stage is None:
+        model.load(path, f'stage_{stage}')
+    return model

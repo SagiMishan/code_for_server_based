@@ -1,666 +1,805 @@
+import math
+import os
+
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import os
-from SmallFunctions import Single_channel_loss_function, Multy_channel_loss_function, dB2lin
+import torch.nn as nn
+import scipy.io
+from Network_multy_channels import Network_multy_channel,load_model
 
 
-def _add_z0_axis(ax_main, itr, z0_ds, color_z0='tab:orange'):
+def norm(input, p=2):
+    return (input.abs() ** p) ** (1 / p)
+
+
+BCEWithLogitsLoss_func = nn.BCEWithLogitsLoss(reduction='none')
+
+
+def sigmoid(x):
+    return 1 / (1 + torch.exp(-x))
+
+
+def softwmax(LL):
+    alpha = 5
+    alpha = 5
+    # Subtract max for numerical stability (log-sum-exp trick).
+    # exp is computed once and reused instead of twice.
+    LL_shifted = LL - LL.max().detach()
+    e = torch.exp(alpha * LL_shifted)
+    return (e * LL).sum() / e.sum()
+
+
+def BCEWithLogitsLoss(pred, ground_truth):
+    beta = 5
+    yground_truth_nt = (ground_truth + 1) / 2
+    LL = torch.mean(BCEWithLogitsLoss_func(beta * pred, yground_truth_nt), 0)
+    return LL
+
+
+def Single_channel_loss_function(pred, ground_truth):
+    return softwmax(BCEWithLogitsLoss(pred, ground_truth))
+
+
+def Multy_channel_loss_function(pred, ground_truth, V, N_channels):
+    sum_loss = torch.tensor(0)
+    for idx in range(N_channels):
+        sum_loss = sum_loss + Single_channel_loss_function(pred[idx], ground_truth[idx] * 2 - 1)
+    sum_loss = sum_loss + V
+    return sum_loss
+
+
+def randomComplexNormal(shape, sigma=1, mu=0):
+    return sigma * torch.randn(shape, dtype=torch.complex64) + mu
+
+
+def transmission_matrix(sources: torch.Tensor,
+                        targets: torch.Tensor,
+                        ref: torch.Tensor,
+                        phi_deg: float,
+                        eps: float = 1e-9) -> torch.Tensor:
     """
-    Attach a right-hand y-axis showing the z0 schedule.
-
-    itr   : 1-D array of iteration indices (must match the main plot x-axis)
-    z0_ds : z0 values sampled at those exact iteration indices
+    sources: (Ns, 2) transmitters
+    targets: (Nt, 2) candidate receivers
+    ref    : (2,) reference point
+    phi_deg: FULL sector angle (degrees). Sector is centered at (source - ref), i.e. away from ref.
+    returns: (Ns, Nt) bool, True if target j lies in source i's TX sector
     """
-    ax_z0 = ax_main.twinx()
-    ax_z0.plot(itr, z0_ds, color=color_z0, linewidth=1.2,
-               linestyle=':', alpha=0.75, label='z0 schedule')
-    ax_z0.set_ylabel('z0 (bias probability)', color=color_z0, fontsize=9)
-    ax_z0.tick_params(axis='y', labelcolor=color_z0)
-    ax_z0.set_ylim(-0.05, 1.15)
-    return ax_z0
+    sources = sources.float()
+    targets = targets.float()
+    ref = ref.view(-1).float()
+
+    Ns, Nt = sources.size(0), targets.size(0)
+    cos_thr = math.cos(math.radians(phi_deg / 2.0))
+
+    # TX sector centers for each source i: C_tx[i] = sources[i] - ref
+    C_tx = sources - ref  # (Ns, 2)
+    C_tx_norm = torch.linalg.norm(C_tx, dim=1, keepdim=True)
+    C_tx_u = torch.where(C_tx_norm > eps, C_tx / C_tx_norm, torch.zeros_like(C_tx))  # (Ns, 2)
+
+    # Pairwise direction from i->j: V[i,j] = targets[j] - sources[i]
+    V = targets.unsqueeze(0) - sources.unsqueeze(1)  # (Ns, Nt, 2)
+    V_norm = torch.linalg.norm(V, dim=2, keepdim=True)  # (Ns, Nt, 1)
+    V_u = torch.where(V_norm > eps, V / V_norm, torch.zeros_like(V))  # (Ns, Nt, 2)
+
+    # Angle test via cosine
+    dots = (V_u * C_tx_u.unsqueeze(1)).sum(dim=2).clamp(-1.0, 1.0)  # (Ns, Nt)
+    return dots >= cos_thr
 
 
-def _combined_legend(ax_main, ax_z0, **legend_kwargs):
-    """Merge legend handles from two axes into one box placed outside the plot."""
-    h1, l1 = ax_main.get_legend_handles_labels()
-    h2, l2 = ax_z0.get_legend_handles_labels()
-    defaults = dict(loc='upper left', bbox_to_anchor=(1.12, 1),
-                    borderaxespad=0, fontsize=8)
-    defaults.update(legend_kwargs)
-    ax_main.legend(h1 + h2, l1 + l2, **defaults)
-
-
-def _save(fig, path, name):
-    """Save figure and always close it cleanly."""
-    fig.savefig(os.path.join(path, 'outputs', name), bbox_inches='tight', dpi=150)
-    plt.close(fig)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main plotting routine – called once per epoch from stage_2
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _plot_all(log: dict, z0_full: torch.Tensor, path: str,
-              epoch, window: int = 10):
+def reception_matrix(sources: torch.Tensor,
+                     targets: torch.Tensor,
+                     ref: torch.Tensor,
+                     phi_deg: float,
+                     eps: float = 1e-9) -> torch.Tensor:
     """
-    Produce one PNG per metric, all with the z0 schedule on a twin axis.
-    epoch can be an int (for per-epoch plots) or the string 'all' (cumulative).
+    sources: (Ns, 2) transmitters
+    targets: (Nt, 2) receivers being tested
+    ref    : (2,) reference point
+    phi_deg: FULL sector angle (degrees). RX sector is centered at (ref - target), i.e. toward ref.
+    returns: (Ns, Nt) bool, True if target j can RX a signal arriving from source i
     """
-    tag = 'all' if epoch == 'all' else f'e{epoch:02d}'
-    title_suffix = 'all epochs' if epoch == 'all' else f'epoch {epoch}'
+    sources = sources.float()
+    targets = targets.float()
+    ref = ref.view(-1).float()
 
-    itr = np.array(log['itr_axis'])
-    C = len(log['BER_per_ch'])
-    ma = np.ones(window) / window
+    Ns, Nt = sources.size(0), targets.size(0)
+    cos_thr = math.cos(math.radians(phi_deg / 2.0))
 
-    # z0 sampled at the exact logged iteration indices — correct x-alignment
-    z0_ds = z0_full[itr].numpy()
+    # RX sector centers for each target j: T_rx[j] = ref - targets[j]
+    T_rx = ref - targets  # (Nt, 2)
+    T_rx_norm = torch.linalg.norm(T_rx, dim=1, keepdim=True)
+    T_rx_u = torch.where(T_rx_norm > eps, T_rx / T_rx_norm, torch.zeros_like(T_rx))  # (Nt, 2)
 
-    colors_ch = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    # Arrival direction at target j from source i is (source - target) = - (targets - sources)
+    V = targets.unsqueeze(0) - sources.unsqueeze(1)  # (Ns, Nt, 2)
+    A = -V  # (Ns, Nt, 2)
+    A_norm = torch.linalg.norm(A, dim=2, keepdim=True)  # (Ns, Nt, 1)
+    A_u = torch.where(A_norm > eps, A / A_norm, torch.zeros_like(A))  # (Ns, Nt, 2)
 
-    # ── 1. Loss ───────────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ax.plot(itr, log['loss'], color='steelblue', alpha=0.4, linewidth=1, label='Loss (raw)')
-    if len(log['loss']) >= window:
-        ma_loss = np.convolve(log['loss'], ma, mode='valid')
-        ax.plot(itr[window - 1:], ma_loss, color='steelblue', linewidth=2,
-                label=f'Loss (MA={window})')
-    ax.set_xlabel('Iteration');
-    ax.set_ylabel('Loss');
-    ax.set_title(f'Training loss — {title_suffix}')
-    ax_z0 = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0)
-    fig.tight_layout(rect=[0, 0, 0.82, 1])
-    _save(fig, path, f'{tag}_loss.png')
-
-    # ── 2. V score ────────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ax.plot(itr, log['v_score'], color='tab:blue', alpha=0.35, linewidth=1, label='V score (raw)')
-    if len(log['v_score']) >= window:
-        ma_v = np.convolve(log['v_score'], ma, mode='valid')
-        ax.plot(itr[window - 1:], ma_v, color='tab:blue', linewidth=2,
-                label=f'V score (MA={window})')
-    ax.set_ylim(0, 1.05)
-    ax.set_xlabel('Iteration');
-    ax.set_ylabel('V score')
-    ax.set_title(f'Channel selection score (V) — {title_suffix}')
-    ax_z0 = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0)
-    fig.tight_layout(rect=[0, 0, 0.82, 1])
-    _save(fig, path, f'{tag}_v_score.png')
-
-    # ── 3. Worst BER (all channels combined) ─────────────────────────────────
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ber_arr = np.array(log['worst_BER'])
-    ber_arr = np.where(ber_arr == 0, np.nan, ber_arr)  # mask zeros for log scale
-    ax.semilogy(itr, ber_arr, color='crimson', alpha=0.45, linewidth=1, label='Worst BER (raw)')
-    valid = ~np.isnan(ber_arr)
-    if valid.sum() >= window:
-        ma_ber = np.convolve(ber_arr[valid], ma, mode='valid')
-        ax.semilogy(itr[valid][window - 1:], ma_ber, color='crimson', linewidth=2,
-                    label=f'Worst BER (MA={window})')
-    ax.set_xlabel('Iteration');
-    ax.set_ylabel('BER (log scale)')
-    ax.set_title(f'Worst-case BER across all channels — {title_suffix}')
-    ax_z0 = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0)
-    fig.tight_layout(rect=[0, 0, 0.82, 1])
-    _save(fig, path, f'{tag}_worst_BER.png')
-
-    # ── 4. Per-channel BER ────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(11, 4))
-    for c in range(C):
-        ber_c = np.array(log['BER_per_ch'][c])
-        ber_c = np.where(ber_c == 0, np.nan, ber_c)
-        col = colors_ch[c % len(colors_ch)]
-        ax.semilogy(itr, ber_c, color=col, alpha=0.35, linewidth=1)
-        valid = ~np.isnan(ber_c)
-        if valid.sum() >= window:
-            ma_c = np.convolve(ber_c[valid], ma, mode='valid')
-            ax.semilogy(itr[valid][window - 1:], ma_c, color=col, linewidth=2,
-                        label=f'Ch {c} BER')
-    ax.set_xlabel('Iteration')
-    ax.set_ylabel('BER (log scale)')
-    ax.set_title(f'Per-channel worst BER — {title_suffix}')
-    ax_z0 = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0)
-    fig.tight_layout(rect=[0, 0, 0.82, 1])
-    _save(fig, path, f'{tag}_BER_per_channel.png')
-
-    # ── 5. N drops ───────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ax.bar(itr, log['n_drops'], width=80, color='slategray', alpha=0.6, label='N drops / 100 itr')
-    ax.set_xlabel('Iteration');
-    ax.set_ylabel('Weights dropped')
-    ax.set_title(f'Weight drops per 100 iterations — {title_suffix}')
-    ax_z0 = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0)
-    fig.tight_layout(rect=[0, 0, 0.82, 1])
-    _save(fig, path, f'{tag}_n_drops.png')
-
-    # ── 6. Active relays per channel ──────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(11, 4))
-    for c in range(C):
-        col = colors_ch[c % len(colors_ch)]
-        ax.plot(itr, log['n_relays_per_ch'][c], color=col, linewidth=1.8,
-                label=f'Ch {c} active relays')
-    ax.set_xlabel('Iteration');
-    ax.set_ylabel('Active relays (P > 0.9)')
-    ax.set_title(f'Active relays per channel — {title_suffix}')
-    ax_z0 = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0)
-    fig.tight_layout(rect=[0, 0, 0.82, 1])
-    _save(fig, path, f'{tag}_active_relays.png')
-
-    # ── 7. Mean |w| per channel ───────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(11, 4))
-    for c in range(C):
-        col = colors_ch[c % len(colors_ch)]
-        ax.plot(itr, log['w_norm_per_ch'][c], color=col, linewidth=1.8,
-                label=f'Ch {c} mean |w|')
-    ax.set_xlabel('Iteration');
-    ax.set_ylabel('Mean |w|')
-    ax.set_title(f'Mean relay gain magnitude per channel — {title_suffix}')
-    ax_z0 = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0)
-    fig.tight_layout(rect=[0, 0, 0.82, 1])
-    _save(fig, path, f'{tag}_w_norm.png')
-
-    # ── 8. Mean |b| per channel ───────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(11, 4))
-    for c in range(C):
-        col = colors_ch[c % len(colors_ch)]
-        ax.plot(itr, log['b_norm_per_ch'][c], color=col, linewidth=1.8,
-                label=f'Ch {c} mean |b|')
-    ax.set_xlabel('Iteration');
-    ax.set_ylabel('Mean |b|')
-    ax.set_title(f'Mean relay bias magnitude per channel — {title_suffix}')
-    ax_z0 = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0)
-    fig.tight_layout(rect=[0, 0, 0.82, 1])
-    _save(fig, path, f'{tag}_b_norm.png')
-
-    # ── 9. P-distribution entropy per channel ────────────────────────────────
-    fig, ax = plt.subplots(figsize=(11, 4))
-    for c in range(C):
-        col = colors_ch[c % len(colors_ch)]
-        ax.plot(itr, log['p_entropy_per_ch'][c], color=col, linewidth=1.8,
-                label=f'Ch {c} P entropy')
-    ax.set_xlabel('Iteration');
-    ax.set_ylabel('Shannon entropy (nats)')
-    ax.set_title(f'Relay-assignment probability entropy per channel — {title_suffix}\n'
-                 '(low → concentrated assignment, high → diffuse)')
-    ax_z0 = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0)
-    fig.tight_layout(rect=[0, 0, 0.82, 1])
-    _save(fig, path, f'{tag}_p_entropy.png')
-
-    # ── 10. Summary panel (2×2 grid) ─────────────────────────────────────────
-    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-    fig.suptitle(f'Stage 2 summary — {title_suffix}', fontsize=13)
-
-    # top-left: V score
-    ax = axes[0, 0]
-    ax.plot(itr, log['v_score'], alpha=0.35, color='tab:blue', linewidth=1)
-    if len(log['v_score']) >= window:
-        ax.plot(itr[window - 1:], np.convolve(log['v_score'], ma, mode='valid'),
-                color='tab:blue', linewidth=2, label='V score')
-    ax.set_ylim(0, 1.05)
-    ax.set_title('V score')
-    ax.set_xlabel('Iteration')
-    ax_z0a = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0a)
-
-    # top-right: worst BER
-    ax = axes[0, 1]
-    ber_arr2 = np.where(np.array(log['worst_BER']) == 0, np.nan, np.array(log['worst_BER']))
-    ax.semilogy(itr, ber_arr2, alpha=0.4, color='crimson', linewidth=1)
-    valid2 = ~np.isnan(ber_arr2)
-    if valid2.sum() >= window:
-        ax.semilogy(itr[valid2][window - 1:],
-                    np.convolve(ber_arr2[valid2], ma, mode='valid'),
-                    color='crimson', linewidth=2, label='Worst BER')
-    ax.set_title('Worst BER');
-    ax.set_xlabel('Iteration')
-    ax_z0b = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0b)
-
-    # bottom-left: N drops
-    ax = axes[1, 0]
-    ax.bar(itr, log['n_drops'], width=80, color='slategray', alpha=0.6, label='N drops')
-    ax.set_title('Weight drops / 100 itr');
-    ax.set_xlabel('Iteration')
-    ax_z0c = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0c)
-
-    # bottom-right: active relays per channel
-    ax = axes[1, 1]
-    for c in range(C):
-        ax.plot(itr, log['n_relays_per_ch'][c],
-                color=colors_ch[c % len(colors_ch)], linewidth=1.8,
-                label=f'Ch {c}')
-    ax.set_title('Active relays per channel');
-    ax.set_xlabel('Iteration')
-    ax_z0d = _add_z0_axis(ax, itr, z0_ds)
-    _combined_legend(ax, ax_z0d)
-
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    _save(fig, path, f'{tag}_summary.png')
+    # Angle test via cosine
+    dots = (A_u * T_rx_u.unsqueeze(0)).sum(dim=2).clamp(-1.0, 1.0)  # (Ns, Nt)
+    return dots >= cos_thr
 
 
-def train_multy_channel(model, num_itr, loss_fn, optimizer, path, z0,
-                        batch=100, SNR=1e-3, max_V=0):
+# def crateNetworkConnaction(path, N_transmitter, N_relays, N_users, N_channels=2, alpha=4, R=1, Phi=45, sector=60,
+#                            R_user=1.1, N_ant=1, freq=2.4e9):
+#     """
+#     N_ant : number of antennas per user (ULA placed on the circumference of the user circle)
+#     freq  : carrier frequency [Hz] — used to compute lambda = c/freq, element spacing = lambda/2
+#
+#     Antenna array geometry
+#     ----------------------
+#     Each user sits at angle theta_u on the circle of radius R_user.
+#     The tangent direction at that point is (-sin(theta_u), cos(theta_u)).
+#     The N_ant antenna elements are placed along this tangent, centred on the
+#     user position, with inter-element spacing d = lambda/2:
+#         ant_pos[u, n] = user_pos[u] + (n - (N_ant-1)/2) * d * tangent[u],  n = 0...N_ant-1
+#
+#     Channel gains to a user with N_ant antennas gain an extra antenna dimension:
+#         cgRU : list[c] of (N_relays, N_users[c], N_ant)   -- relay to user antennas
+#         cgTU : list[c] of (N_users[c], N_ant)             -- TX to user antennas
+#     """
+#     c_light = 3e8  # speed of light [m/s]
+#     lam = c_light / freq  # wavelength [m]
+#     d_ant = lam / 2  # inter-element spacing [m]
+#
+#     # ── 1. Relay positions: uniform random inside disk of radius R ────────────
+#     r = R * torch.sqrt(torch.rand(N_relays))
+#     phi_relay = 2 * torch.pi * torch.rand(N_relays)
+#     relay_x = r * torch.cos(phi_relay)
+#     relay_y = r * torch.sin(phi_relay)
+#     points = torch.stack((relay_x, relay_y), dim=1)
+#     posR = points  # (N_relays, 2)
+#     dists_RR = torch.cdist(posR, posR)  # (N_relays, N_relays)
+#
+#     # ── 2. Transmitter positions: equally spaced on circle of radius R_user ──
+#     # Spacing = 2*pi / N_transmitter  ->  maximally far apart from each other.
+#     phi_trans = 2 * torch.pi * torch.arange(N_transmitter) / N_transmitter
+#     trans_x = R_user * torch.cos(phi_trans)
+#     trans_y = R_user * torch.sin(phi_trans)
+#     trans_points = torch.stack((trans_x, trans_y), dim=1)  # (N_transmitter, 2)
+#
+#     # ── 3. Receiver (user) positions + per-antenna positions ─────────────────
+#     # The sector angular width is given by the `sector` input parameter.
+#     # Receivers are spaced uniformly within that sector, centred opposite
+#     # the TX (i.e. shifted by pi from the TX angle).
+#     sector_rad = np.deg2rad(sector)
+#     half_sector = sector_rad / 2
+#
+#     # Antenna element offsets along the tangent: centred at 0, step = lambda/2
+#     # The straight-line (Cartesian) distance between adjacent elements is lambda/2.
+#     ant_idx = torch.arange(N_ant) - (N_ant - 1) / 2.0  # (N_ant,)  e.g. -1, 0, 1 for N_ant=3
+#     ant_offsets = ant_idx * d_ant  # (N_ant,)  in metres
+#
+#     user_point = []  # list[c] of (N_users[c], 2)         -- user centres
+#     user_ant_point = []  # list[c] of (N_users[c], N_ant, 2)  -- antenna positions
+#
+#     for c in range(N_channels):
+#         n_u = N_users[c]
+#         if n_u == 1:
+#             offsets = torch.tensor([0.0])
+#         else:
+#             offsets = torch.linspace(-half_sector, half_sector, n_u)
+#
+#         # User centre angles (opposite side of circle from TX)
+#         base_angle = phi_trans[c] + np.pi + offsets  # (n_u,)
+#         u_x = R_user * torch.cos(base_angle)  # (n_u,)
+#         u_y = R_user * torch.sin(base_angle)  # (n_u,)
+#         centres = torch.stack((u_x, u_y), dim=1)  # (n_u, 2)
+#         user_point.append(centres)
+#
+#         # Tangent direction at each user position: (-sin(theta), cos(theta))
+#         # This is the unit vector along the circumference at that point.
+#         tangent = torch.stack((-torch.sin(base_angle),
+#                                torch.cos(base_angle)), dim=1)  # (n_u, 2)
+#
+#         # Antenna positions in Cartesian coordinates:
+#         #   ant_pos[u, i] = centre[u] + ant_offsets[i] * tangent[u]
+#         # Straight-line distance between adjacent elements = d_ant = lambda/2
+#         # centres:     (n_u, 2)  -> (n_u, 1, 2)
+#         # ant_offsets: (N_ant,)  -> (1, N_ant, 1)
+#         # tangent:     (n_u, 2)  -> (n_u, 1, 2)
+#         ant_pos = centres.unsqueeze(1) + ant_offsets.view(1, N_ant, 1) * tangent.unsqueeze(1)
+#         # shape: (n_u, N_ant, 2)
+#         user_ant_point.append(ant_pos)
+#
+#     posU = user_point
+#
+#     # ── 4. Build channel matrices per channel ─────────────────────────────────
+#     all_connectaionMatrix = []
+#     MatcgSR = []
+#     MatcgRR = []
+#     cgRU = []  # list[c] of (N_relays, N_users[c], N_ant)
+#     cgTU = []  # list[c] of (N_users[c], N_ant)
+#
+#     for c in range(N_channels):
+#         connectaionMatrix = torch.zeros((N_relays + 1, N_relays + 1))
+#
+#         # ── Relay-to-relay connectivity (directional antenna masks) ───────────
+#         transmit_to = transmission_matrix(posR, posR, trans_points[c], Phi)
+#         recive_from = reception_matrix(posR, posR, trans_points[c], Phi)
+#         links = transmit_to & recive_from
+#         links.fill_diagonal_(False)
+#         connectaionMatrix[:N_relays, :N_relays] = links * 1
+#
+#         # ── Relay-to-relay channel gains ──────────────────────────────────────
+#         v = randomComplexNormal([dists_RR.shape[0], dists_RR.shape[1]])
+#         cg_RR = connectaionMatrix[:N_relays, :N_relays] * v * torch.pow(
+#             dists_RR, torch.Tensor([-alpha / 2]))
+#         MatcgRR.append(cg_RR)
+#
+#         # ── TX-to-relay connectivity & channel gains ──────────────────────────
+#         TO = -trans_points[c]
+#         TR = posR - trans_points[c]
+#         cos_tx = ((TO * TR).sum(dim=1) / (
+#                 torch.norm(TR, dim=1) * torch.norm(TO)
+#         )).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+#
+#         connectaionMatrix[-1, :N_relays] = cos_tx >= torch.cos(torch.tensor(np.deg2rad(Phi / 2)))
+#         dists_SR = torch.cdist(points, trans_points[c].unsqueeze(0))
+#         v = randomComplexNormal([N_relays, 1])
+#         cg_SR = connectaionMatrix[-1, :N_relays].unsqueeze(1) * v * torch.pow(
+#             dists_SR, torch.Tensor([-alpha / 2]))
+#         MatcgSR.append(cg_SR.T)
+#         all_connectaionMatrix.append(connectaionMatrix)
+#
+#         # ── Relay-to-user connectivity & channel gains per antenna ──────────────
+#         # Connectivity is tested per antenna element:
+#         #   relay n can reach antenna (u, a) if the arrival angle is within Phi.
+#         # A user is reachable if at least one of its antennas passes the test.
+#         ant_pos_c = user_ant_point[c]  # (N_users[c], N_ant, 2)
+#         ant_pos_flat = ant_pos_c.reshape(-1, 2)  # (N_users[c]*N_ant, 2)
+#
+#         # Build per-antenna connectivity mask: (N_relays, N_users[c]*N_ant)
+#         connectaionMatrix_ant = torch.zeros(N_relays, N_users[c] * N_ant)
+#         for idx in range(N_users[c]):
+#             for a in range(N_ant):
+#                 ant_xy = ant_pos_c[idx, a]  # (2,)  this antenna's position
+#                 p2O = ant_xy - trans_points[c]  # direction: antenna -> TX origin
+#                 p2p1 = ant_xy - posR  # direction: antenna -> each relay (N_relays, 2)
+#                 dot_rx = (p2p1 * p2O).sum(dim=1) / (
+#                         1e-6 + torch.norm(p2p1, dim=1) * torch.norm(p2O))
+#                 dot_rx = dot_rx.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+#                 col = idx * N_ant + a
+#                 connectaionMatrix_ant[:, col] = dot_rx >= torch.cos(torch.tensor(Phi / 2))
+#
+#         # Check every user has at least one reachable antenna
+#         # Sum over the N_ant columns belonging to each user
+#         ant_mask_per_user = connectaionMatrix_ant.view(N_relays, N_users[c], N_ant)
+#         reachable = ant_mask_per_user.sum(dim=0).sum(dim=1)  # (N_users[c],)
+#         if torch.any(reachable == 0):
+#             raise Exception("Sorry, for one of users signal canot be reach , try again")
+#
+#         # ── Relay-to-user channel gains: (N_relays, N_users[c]*N_ant) ───────────
+#         dists_RU_flat = torch.cdist(points, ant_pos_flat)  # (N_relays, N_users[c]*N_ant)
+#         v_RU = randomComplexNormal([N_relays, N_users[c] * N_ant])
+#         cgRU.append(connectaionMatrix_ant * v_RU * torch.pow(dists_RU_flat, -alpha / 2))
+#         # shape: (N_relays, N_users[c]*N_ant)
+#
+#         # ── TX-to-user channel gains: (N_users[c]*N_ant,) ────────────────────
+#         tx_pos_c = trans_points[c].unsqueeze(0)  # (1, 2)
+#         dists_TU_flat = torch.cdist(tx_pos_c, ant_pos_flat)  # (1, N_users[c]*N_ant)
+#         v_TU = randomComplexNormal([1, N_users[c] * N_ant])
+#         cgTU.append((v_TU * torch.pow(dists_TU_flat, -alpha / 2)).squeeze(0))
+#         # shape: (N_users[c]*N_ant,)
+#
+#         # ── Visualisation ─────────────────────────────────────────────────────
+#         cmap = plt.get_cmap("tab10")
+#         color = cmap(c % cmap.N)
+#         plt.scatter(trans_points[c, 0], trans_points[c, 1],
+#                     marker="$T$", s=200, color=color)
+#         plt.scatter(posU[c][:, 0], posU[c][:, 1],
+#                     marker="$R$", s=200, color=color)
+#         # Show individual antenna element positions
+#         ant_flat = ant_pos_c.reshape(-1, 2)
+#         plt.scatter(ant_flat[:, 0], ant_flat[:, 1],
+#                     marker="+", s=60, color=color, linewidths=0.8)
+#
+#     color = cmap((N_channels + 1) % cmap.N)
+#     plt.scatter(posR[:, 0], posR[:, 1], marker="o", s=100, color=color)
+#     plt.savefig(path + "blank_architecture.png")
+#     plt.show()
+#
+#     return all_connectaionMatrix, MatcgSR, MatcgRR, cgRU, cgTU, posR, posU, trans_points
+#
+
+def crateNetworkConnaction(path, N_transmitter, N_relays, N_users, N_channels=2, alpha=4, R=1, Phi=45, sector=60,
+                           R_user=1.1, N_rx=2, N_tx=1, d_spacing=0.01):
     """
-    Run one epoch of multi-channel training (stage 2).
+    N_rx  : number of receive antennas per user (ULA along the tangent of the user circle)
+    N_tx  : number of transmit antennas per transmitter (ULA along the tangent of the TX circle)
+    d_spacing : inter-element antenna spacing in metres (default 0.1 m = 10 cm)
 
-    Returns
-    -------
-    BER          : np.ndarray [num_itr//100]  worst BER across channels
-    runnig_loss  : np.ndarray [num_itr//100]  total loss value
-    SCORE        : torch.Tensor [num_itr//100] V score
-    runnig_drops : torch.Tensor [num_itr//100] weight drops per window
-    log          : dict  – all raw per-step metrics (see _plot_all for keys)
+    Antenna array geometry
+    ----------------------
+    Both TX and RX arrays are placed along the tangent of the circle at their position,
+    centred on the node, with inter-element Cartesian spacing d = d_spacing:
+        ant_pos[n] = centre + (n - (N-1)/2) * d_spacing * tangent,  n = 0 ... N-1
+
+    Channel gain shapes:
+        MatcgSR : list[c] of (N_relays, N_tx)               -- TX antennas to relay
+        cgRU    : list[c] of (N_relays, N_users[c]*N_rx)    -- relay to RX antennas
+        cgTU    : list[c] of (N_tx, N_users[c]*N_rx)        -- TX antennas to RX antennas
     """
-    C = model.N_channels
-    N = model.N_relays
-    LOG = num_itr // 100  # number of logging steps
+    d_ant = d_spacing  # inter-element spacing [m]
 
-    BER = np.zeros(LOG)
-    SCORE = torch.zeros(LOG)
-    runnig_loss = np.zeros(LOG)
-    runnig_drops = torch.zeros(LOG)
-    moving_drops = 0
+    # ── 1. Relay positions: uniform random inside disk of radius R ────────────
+    r = R * torch.sqrt(torch.rand(N_relays))
+    phi_relay = 2 * torch.pi * torch.rand(N_relays)
+    relay_x = r * torch.cos(phi_relay)
+    relay_y = r * torch.sin(phi_relay)
+    points = torch.stack((relay_x, relay_y), dim=1)
+    posR = points  # (N_relays, 2)
+    dists_RR = torch.cdist(posR, posR)  # (N_relays, N_relays)
 
-    # Pre-initialise the per-step log dict
-    log = dict(
-        itr_axis=[],
-        loss=[],
-        v_score=[],
-        n_drops=[],
-        worst_BER=[],
-        BER_per_ch={c: [] for c in range(C)},
-        n_relays_per_ch={c: [] for c in range(C)},
-        w_norm_per_ch={c: [] for c in range(C)},
-        b_norm_per_ch={c: [] for c in range(C)},
-        p_entropy_per_ch={c: [] for c in range(C)},
-        bais_probability=[],
-    )
+    # ── 2. Transmitter positions: equally spaced on circle of radius R_user ──
+    # Spacing = 2*pi / N_transmitter  ->  maximally far apart from each other.
+    phi_trans = 2 * torch.pi * torch.arange(N_transmitter) / N_transmitter
+    trans_x = R_user * torch.cos(phi_trans)
+    trans_y = R_user * torch.sin(phi_trans)
+    trans_points = torch.stack((trans_x, trans_y), dim=1)  # (N_transmitter, 2)
 
-    snr_lin = dB2lin(SNR)
-    for c in range(C):
-        model.sub_networks[c].SNR = snr_lin
+    # ── 3. Receiver (user) positions + per-antenna positions ─────────────────
+    # The sector angular width is given by the `sector` input parameter.
+    # Receivers are spaced uniformly within that sector, centred opposite
+    # the TX (i.e. shifted by pi from the TX angle).
+    sector_rad = np.deg2rad(sector)
+    half_sector = sector_rad / 2
 
-    all_pred = [None] * C
-    all_bits = [None] * C
+    # ── RX antenna offsets (per user) ────────────────────────────────────────
+    # Centred at 0, step = d_spacing, along the tangent of the user circle.
+    rx_idx = torch.arange(N_rx) - (N_rx - 1) / 2.0  # (N_rx,)
+    rx_offsets = rx_idx * d_ant  # (N_rx,)  metres
 
-    _device = next(model.parameters()).device
-    for itr in range(num_itr):
-        optimizer.zero_grad()
-        loss = torch.tensor(0.0, dtype=torch.float, device=_device)
+    # ── TX antenna offsets (per transmitter) ─────────────────────────────────
+    tx_idx = torch.arange(N_tx) - (N_tx - 1) / 2.0  # (N_tx,)
+    tx_offsets = tx_idx * d_ant  # (N_tx,)  metres
 
-        for c in range(C):
-            model.sub_networks[c].train()
-            signal, bits = model.sub_networks[c].modulator(batch)
-            rm = model.sub_networks[c](signal, bits)
-            pred = model.sub_networks[c].demodulator(rm)
+    user_point = []  # list[c] of (N_users[c], 2)          -- user centres
+    user_ant_point = []  # list[c] of (N_users[c], N_rx, 2)    -- RX antenna positions
 
-            all_pred[c] = pred.detach()
-            all_bits[c] = bits
+    for c in range(N_channels):
+        n_u = N_users[c]
+        if n_u == 1:
+            offsets = torch.tensor([0.0])
+        else:
+            offsets = torch.linspace(-half_sector, half_sector, n_u)
 
-            sum_v_c = model.sub_networks[c].V.sum()
-            loss = loss + loss_fn(pred, bits * 2 - 1) + 1e-1 * sum_v_c / N
+        # User centre angles (opposite side of circle from TX)
+        base_angle = phi_trans[c] + np.pi + offsets  # (n_u,)
+        u_x = R_user * torch.cos(base_angle)  # (n_u,)
+        u_y = R_user * torch.sin(base_angle)  # (n_u,)
+        centres = torch.stack((u_x, u_y), dim=1)  # (n_u, 2)
+        user_point.append(centres)
 
-        loss.backward()
-        # if nan output this code will help to find it
-        # nan_found = False
-        # for name, p in model.named_parameters():
-        #     if p.grad is None:
-        #         continue
-        #     if not torch.isfinite(p.grad).all():
-        #         n_nan = (~torch.isfinite(p.grad)).sum().item()
-        #         n_tot = p.grad.numel()
-        #         print(f"[GRAD NaN] {name}  —  {n_nan}/{n_tot} values non-finite  "
-        #               f"|grad|_max={p.grad.abs().nan_to_num().max().item():.4f}")
-        #         nan_found = True
-        #
-        # if nan_found:
-        #     # print which relay index is the problem
-        #     for c in range(model.N_channels):
-        #         w = model.sub_networks[c].w
-        #         b = model.sub_networks[c].b
-        #         if w.grad is not None:
-        #             bad = (~torch.isfinite(w.grad)).any(dim=1)
-        #             if bad.any():
-        #                 print(f"  ch{c} bad relay indices (w.grad): {bad.nonzero().squeeze().tolist()}")
-        #         if b.grad is not None:
-        #             bad = (~torch.isfinite(b.grad)).any(dim=1)
-        #             if bad.any():
-        #                 print(f"  ch{c} bad relay indices (b.grad): {bad.nonzero().squeeze().tolist()}")
-        #
+        # RX tangent direction at each user position: (-sin(theta), cos(theta))
+        rx_tangent = torch.stack((-torch.sin(base_angle),
+                                  torch.cos(base_angle)), dim=1)  # (n_u, 2)
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        #  if nan as an ouput this code will help to find it
-        # for name, p in model.named_parameters():
-        #     if not torch.isfinite(p).all():
-        #         print(f"  [WARNING] non-finite parameter {name} at itr {itr}")
-        #     if p.grad is not None and not torch.isfinite(p.grad.norm()).all():
-        #         print(f"  [WARNING] non-finite grad in {name}, zeroing")
-        #         p.grad.zero_()
+        # RX antenna positions: ant_pos[u, i] = centre[u] + rx_offsets[i] * rx_tangent[u]
+        # centres:     (n_u, 2)  -> (n_u, 1, 2)
+        # rx_offsets:  (N_rx,)   -> (1, N_rx, 1)
+        # rx_tangent:  (n_u, 2)  -> (n_u, 1, 2)
+        ant_pos = centres.unsqueeze(1) + rx_offsets.view(1, N_rx, 1) * rx_tangent.unsqueeze(1)
+        # shape: (n_u, N_rx, 2)
+        user_ant_point.append(ant_pos)
 
-        # for name, p in model.named_parameters():
-        #     if not torch.isfinite(p).all():
-        #         print(f"  [WARNING] non-finite parameter {name} at itr {itr}")
-        #     if p.grad is not None and not torch.isfinite(p.grad.norm()).all():
-        #         print(f"  [WARNING] non-finite grad in {name}, zeroing")
-        #         p.grad.zero_()
-        model.update_v()
-        model.culc_p()
+    posU = user_point
 
-        current_drop = model.drop_weights(z0=z0[itr])
-        moving_drops += current_drop
+    # ── 3b. TX antenna positions per transmitter ─────────────────────────────
+    # Each TX also has an array along the tangent of the TX circle.
+    # tx_ant_point[c]: (N_tx, 2)
+    tx_ant_point = []
+    for c in range(N_channels):
+        tx_tangent = torch.stack((-torch.sin(phi_trans[c:c + 1]),
+                                  torch.cos(phi_trans[c:c + 1])), dim=1)  # (1, 2)
+        tx_ant_pos = trans_points[c].unsqueeze(0) + tx_offsets.view(N_tx, 1) * tx_tangent  # (N_tx, 2)
+        tx_ant_point.append(tx_ant_pos)
 
-        # ── Logging every 100 iterations ─────────────────────────────────────
-        if itr % 100 == 0:
-            li = itr // 100  # log index
-            loss_val = loss.item()
-            runnig_loss[li] = loss_val
+    # ── 4. Build channel matrices per channel ─────────────────────────────────
+    all_connectaionMatrix = []
+    MatcgSR = []  # list[c] of (N_relays, N_tx)
+    MatcgRR = []
+    cgRU = []  # list[c] of (N_relays, N_users[c]*N_rx)
+    cgTU = []  # list[c] of (N_tx, N_users[c]*N_rx)
 
-            score = model.learn_score()
-            SCORE[li] = score
+    for c in range(N_channels):
+        connectaionMatrix = torch.zeros((N_relays + 1, N_relays + 1))
 
-            runnig_drops[li] = moving_drops if itr == 0 else moving_drops / 100
+        # ── Relay-to-relay connectivity (directional antenna masks) ───────────
+        transmit_to = transmission_matrix(sources=posR, targets=posR, ref=trans_points[c], phi_deg=Phi)
+        recive_from = reception_matrix(sources=posR, targets=posR, ref=trans_points[c], phi_deg=Phi)
+        links = transmit_to & recive_from
+        links.fill_diagonal_(False)
+        connectaionMatrix[:N_relays, :N_relays] = links * 1
 
-            # ── per-channel metrics ───────────────────────────────────────────
-            total_worst = 0.0
-            score_detach = score.detach()
-            out_string = "{:<2}/{} score={:.4f}".format(li + 1, LOG, float(score_detach))
+        # ── Relay-to-relay channel gains ──────────────────────────────────────
+        v = randomComplexNormal([dists_RR.shape[0], dists_RR.shape[1]])
+        cg_RR = connectaionMatrix[:N_relays, :N_relays] * v * torch.pow(
+            dists_RR, torch.Tensor([-alpha / 2]))
+        MatcgRR.append(cg_RR)
 
-            for c in range(C):
-                worst_BER, avg_BER, best_BER = model.sub_networks[c].BER(
-                    bits=all_bits[c], pred=all_pred[c])
-                total_worst = max(total_worst, float(worst_BER))
+        # ── TX-to-relay connectivity & channel gains ──────────────────────────
+        TO = -trans_points[c]
+        TR = posR - trans_points[c]
+        # dot_tx = torch.acos(
+        #     (TO * TR).sum(dim=1) / (torch.norm(TR, dim=1) * torch.norm(TO))
+        # ).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        # connectaionMatrix[-1, :N_relays] = dot_tx >= torch.cos(
+        #     torch.tensor(np.deg2rad(sector/2)))
+        cos_tx = ((TO * TR).sum(dim=1) /
+                  (torch.norm(TR, dim=1) * torch.norm(TO) + 1e-9)
+                  ).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        # Relay is inside the TX sector if angle <= sector/2
+        # i.e. cos(angle) >= cos(sector/2)
+        cos_half_sector = torch.cos(torch.tensor(np.deg2rad(sector / 2)))
+        connectaionMatrix[-1, :N_relays] = cos_tx >= cos_half_sector
 
-                # active relays: P > 0.9
-                active = int(sum(model.P[c][:] > 0.9)[0])
+        # ── TX antenna to relay: (N_relays, N_tx) ───────────────────────────────
+        # Distance from each TX antenna element to each relay.
+        dists_SR = torch.cdist(points, tx_ant_point[c])  # (N_relays, N_tx)
+        v_SR = randomComplexNormal([N_relays, N_tx])
+        # Connectivity mask broadcast over TX antennas: (N_relays, 1)
+        mask_SR = connectaionMatrix[-1, :N_relays].unsqueeze(1)
+        cg_SR = mask_SR * v_SR * torch.pow(dists_SR, -alpha / 2)
+        MatcgSR.append(cg_SR)  # (N_relays, N_tx)
+        all_connectaionMatrix.append(connectaionMatrix)
 
-                # mean magnitude of w and b for this channel
-                w_mag = model.sub_networks[c].w.abs().mean().item()
-                b_mag = model.sub_networks[c].b.abs().mean().item()
+        # ── Relay-to-user connectivity & channel gains per antenna ──────────────
+        # Connectivity is tested per antenna element:
+        #   relay n can reach antenna (u, a) if the arrival angle is within Phi.
+        # A user is reachable if at least one of its antennas passes the test.
+        ant_pos_c = user_ant_point[c]  # (N_users[c], N_rx, 2)
+        ant_pos_flat = ant_pos_c.reshape(-1, 2)  # (N_users[c]*N_rx, 2)
 
-                # Shannon entropy of P distribution for this channel (nats)
-                p_c = model.P[c].detach().squeeze().clamp(min=1e-9)
-                entropy = float(-(p_c * p_c.log()).sum())
+        # Build per-RX-antenna connectivity mask: (N_relays, N_users[c]*N_rx)
+        connectaionMatrix_ant = torch.zeros(N_relays, N_users[c] * N_rx)
+        for idx in range(N_users[c]):
+            for a in range(N_rx):
+                ant_xy = ant_pos_c[idx, a]  # (2,)
+                p2O = ant_xy - trans_points[c]  # direction: RX antenna -> TX centre
+                p2p1 = ant_xy - posR  # direction: RX antenna -> each relay
+                cos_rx = ((p2O * p2p1).sum(dim=1) /
+                          (torch.norm(p2p1, dim=1) * torch.norm(p2O) + 1e-9)
+                          ).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+                # Relay is inside the TX sector if angle <= sector/2
+                # i.e. cos(angle) >= cos(sector/2)
+                cos_half_sector = torch.cos(torch.tensor(np.deg2rad(Phi / 2)))
+                col = idx * N_rx + a
+                connectaionMatrix_ant[:, col] = cos_rx >= cos_half_sector
 
-                log['BER_per_ch'][c].append(float(worst_BER))
-                log['n_relays_per_ch'][c].append(active)
-                log['w_norm_per_ch'][c].append(w_mag)
-                log['b_norm_per_ch'][c].append(b_mag)
-                log['p_entropy_per_ch'][c].append(entropy)
-                log["bais_probability"].append(z0[itr])
-                out_string += "  | ch{} BER={:.3f} relays={} |w|={:.3f} |b|={:.3f}".format(
-                    c, float(worst_BER), active, w_mag, b_mag)
+        # Check every user has at least one reachable RX antenna
+        ant_mask_per_user = connectaionMatrix_ant.view(N_relays, N_users[c], N_rx)
+        reachable = ant_mask_per_user.sum(dim=0).sum(dim=1)  # (N_users[c],)
+        if torch.any(reachable == 0):
+            raise Exception("Sorry, for one of users signal canot be reach , try again")
 
-            BER[li] = total_worst
+        # ── Relay-to-user channel gains: (N_relays, N_users[c]*N_rx) ────────────
+        dists_RU_flat = torch.cdist(points, ant_pos_flat)  # (N_relays, N_users[c]*N_rx)
+        v_RU = randomComplexNormal([N_relays, N_users[c] * N_rx])
+        cgRU.append(connectaionMatrix_ant * v_RU * torch.pow(dists_RU_flat, -alpha / 2))
+        # shape: (N_relays, N_users[c]*N_rx)
 
-            log['itr_axis'].append(itr)
-            log['loss'].append(loss_val)
-            log['v_score'].append(float(score_detach))
-            log['n_drops'].append(float(runnig_drops[li]))
-            log['worst_BER'].append(total_worst)
+        # ── TX-to-user channel gains: (N_tx, N_users[c]*N_rx) ────────────────
+        # Each TX antenna to each RX antenna.
+        dists_TU_flat = torch.cdist(tx_ant_point[c], ant_pos_flat)  # (N_tx, N_users[c]*N_rx)
+        v_TU = randomComplexNormal([N_tx, N_users[c] * N_rx])
+        cgTU.append(v_TU * torch.pow(dists_TU_flat, -alpha / 2))
+        # shape: (N_tx, N_users[c]*N_rx)
 
-            out_string += "  z0={:.4f}  drops={:.1f}".format(
-                float(z0[itr]), runnig_drops[li])
-            print(out_string)
+        # ── Visualisation ─────────────────────────────────────────────────────
+        cmap = plt.get_cmap("tab10")
+        color = cmap(c % cmap.N)
+        plt.scatter(trans_points[c, 0], trans_points[c, 1],
+                    marker="$T$", s=200, color=color)
+        plt.scatter(posU[c][:, 0], posU[c][:, 1],
+                    marker="$R$", s=200, color=color)
+        # Show RX antenna element positions
+        rx_flat = ant_pos_c.reshape(-1, 2)
+        plt.scatter(rx_flat[:, 0], rx_flat[:, 1],
+                    marker="+", s=60, color=color, linewidths=0.8)
+        # Show TX antenna element positions
+        plt.scatter(tx_ant_point[c][:, 0], tx_ant_point[c][:, 1],
+                    marker="x", s=60, color=color, linewidths=0.8)
 
-            moving_drops = 0
-            if abs(1 - score) < 1e-2:
-                return BER, runnig_loss, SCORE, runnig_drops, log
+    color = cmap((N_channels + 1) % cmap.N)
+    plt.scatter(posR[:, 0], posR[:, 1], marker="o", s=100, color=color)
+    plt.savefig(os.path.join(path, "blank_architecture.png"))
+    plt.clf()
 
-    return BER, runnig_loss, SCORE, runnig_drops, log
-
-
-def _fast_learn_score(model):
-    """
-    Compute learn_score() without calling update_v() again.
-    Assumes model.update_v() was already called this iteration.
-    Mirrors Network_multy_channel.learn_score() exactly.
-    """
-    dev = next(model.parameters()).device
-    relay_v_sum = torch.zeros((model.N_relays, 1), device=dev)
-    relay_v_max = -torch.ones((model.N_relays, 1), device=dev)
-    C = model.N_channels
-    for c in range(C):
-        v = model.sub_networks[c].V
-        relay_v_sum = relay_v_sum + v
-        relay_v_max = torch.maximum(relay_v_max, v)
-    relay_v_sum = relay_v_sum.clamp(min=1e-6)
-    relay_v_max = relay_v_max.clamp(min=1e-6)
-    score = torch.sum(C / (C - 1) * relay_v_max / relay_v_sum - 1 / (C - 1))
-    return (score / model.N_relays).item()
-
-
-def stage_1(model, basic_training, SNR_basic_trainning, SNR_max, SNR_step, max_iteration, BER_th,
-            device, path):
-    loss_fn_SC = Single_channel_loss_function
-    if basic_training:
-        max_snr_train = -100000
-        for c in range(model.N_channels):
-            SNR = SNR_max
-            flag_BER = False
-            optimizer = torch.optim.Adam(model.sub_networks[c].parameters(), lr=1e-3)
-            epochs = 0
-            while True:
-                if not flag_BER:
-                    print("stage 1 - channel {} -- Epoch {} - SNR: {:.2f}\n"
-                          "-------------------------------".format(c, epochs, SNR_basic_trainning))
-                    BER, loss = model.train_single_channel(num_itr=1000, model_idx=c,
-                                                           loss_fn=loss_fn_SC, optimizer=optimizer,
-                                                           device=device, batch=512,
-                                                           SNR=SNR_basic_trainning)
-                    epochs += 1
-                    if np.mean(BER) == 0:
-                        epochs = 0
-                        flag_BER = True
-                        print("changed flag")
-                    if epochs >= max_iteration:
-                        break
-                else:
-                    print("stage 1 - channel {} -- Epoch {} - SNR: {:.2f}\n"
-                          "-------------------------------".format(c, epochs, SNR))
-                    BER, loss = model.train_single_channel(num_itr=1000, model_idx=c,
-                                                           loss_fn=loss_fn_SC, optimizer=optimizer,
-                                                           device=device, batch=2 ** 7, SNR=SNR)
-                    if np.mean(BER) < max(BER_th, 2 ** -7):
-                        SNR = SNR - SNR_step
-                        epochs = 0
-                    if epochs >= max_iteration:
-                        break
-                    epochs += 1
-                # print("testing")
-                # model.test_single_channel(model_idx=c, loss_fn=loss_fn_SC, device=device,
-                #                           batch=2 ** 7,
-                #                           SNR=torch.linspace(SNR - 10, SNR + 10, 21))
-            max_snr_train = max(SNR, max_snr_train)
-            print("Done! training")
-
-        torch.save(max_snr_train, path + "\\data\\max_snr_train_stage_1")
-        model.save(path, "stage_1")
-    else:
-        model.load(path, "stage_1")
-        max_snr_train = torch.load(path + "\\data\\max_snr_train_stage_1", weights_only=True)
-
-    return max_snr_train
+    return all_connectaionMatrix, MatcgSR, MatcgRR, cgRU, cgTU, posR, posU, trans_points
 
 
-def stage_2(model, max_snr_train, epochs, device, path, z0_type, sub_stages,
-            z0_init=0.01, z0_end=0.01, B=torch.tensor(10)):
-    loss_fn_SC = Single_channel_loss_function
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-
-    # ── build z0 schedule ────────────────────────────────────────────────────
-    total_itr = epochs * 1000
-    if z0_init == z0_end and z0_type == "const":
-        print("stage 2 with Const z0 = {}".format(z0_init))
-        z0 = z0_init * torch.ones(total_itr + 1)
-
-    elif (not z0_init == z0_end) and z0_type == "linear":
-        print("stage 2 with linear s {} E {}".format(z0_init, z0_end))
-        z0 = torch.linspace(z0_init, z0_end, total_itr + 1)
-
-    elif z0_type == "exp":
-        print("stage 2 with exp - B = {}".format(B))
-        no_drop = torch.zeros(int(total_itr * sub_stages[0]) - 1)
-        ramp = torch.exp(
-            -B * (1 - torch.arange(0, total_itr * sub_stages[1] + 1)
-                  / (total_itr * sub_stages[1])))
-        always = torch.ones(int(total_itr * sub_stages[2]))
-        z0 = torch.cat((no_drop, ramp, always))
-    else:
-        raise ValueError(f"Unknown z0_type: {z0_type}")
-
-    # ── accumulators across all epochs ───────────────────────────────────────
-    ALL_SCORE = []
-    ALL_N_DROPS = []
-    ALL_LOGS = []  # one log dict per epoch
-
-    max_V = 0
-    for t in range(epochs):
-        print("\nstage 2 - Epoch {} / {} - SNR: {:.2f}\n{}".format(
-            t + 1, epochs, max_snr_train, '-' * 40))
-
-        z0_epoch = z0[t * 1000: (t + 1) * 1000]
-
-        BER, loss_arr, score, drops, log = train_multy_channel(
-            model=model,
-            num_itr=1000,
-            loss_fn=loss_fn_SC,
-            optimizer=optimizer,
-            batch=2 ** 7,
-            SNR=max_snr_train,
-            z0=z0_epoch,
-            path=path,
-            max_V=max_V,
-        )
-
-        ALL_SCORE.append(score)
-        ALL_N_DROPS.append(drops)
-        ALL_LOGS.append(log)
-
-        # ── save raw data for this epoch ──────────────────────────────────────
-        data_ep = dict(
-            BER=BER,
-            loss=loss_arr,
-            score=score.detach().numpy(),
-            drops=drops.detach().numpy(),
-            z0_epoch=z0_epoch.numpy(),
-            log=log,
-        )
-        # torch.save(data_ep,
-        #            os.path.join(path, 'data', f'stage2_epoch{t + 1:02d}_raw.pt'))
-
-        # ── per-epoch plots ───────────────────────────────────────────────────
-        # log['itr_axis'] are local (0..999); shift to global iteration index
-        global_offset = t * 1000
-        log_global = dict(log)  # shallow copy
-        log_global['itr_axis'] = [i + global_offset for i in log['itr_axis']]
-
-        # _plot_all(log_global, z0, path, epoch=t + 1)
-
-        # ── early-stop check ─────────────────────────────────────────────────
-        if abs(model.learn_score() - 1) <= 1e-2:
-            print("got a V score = 1 , stop stage 2")
-            epochs = t + 1  # update for the cumulative plots below
-            break
-
-    # ── finalise model ────────────────────────────────────────────────────────
-    model.set_weights()
-    model.save(path, "stage_2")
-
-    # ── cumulative plots across all epochs ────────────────────────────────────
-    SCORE_all = torch.cat(ALL_SCORE, dim=0).detach().numpy()
-    DROPS_all = torch.cat(ALL_N_DROPS, dim=0).detach().numpy()
-
-    # Build a single merged log for all epochs
-    merged = dict(
-        itr_axis=[],
-        loss=[],
-        v_score=[],
-        n_drops=[],
-        worst_BER=[],
-        BER_per_ch={c: [] for c in range(model.N_channels)},
-        n_relays_per_ch={c: [] for c in range(model.N_channels)},
-        w_norm_per_ch={c: [] for c in range(model.N_channels)},
-        b_norm_per_ch={c: [] for c in range(model.N_channels)},
-        p_entropy_per_ch={c: [] for c in range(model.N_channels)},
-        bais_probability=[]
-    )
-    for t, lg in enumerate(ALL_LOGS):
-        offset = t * 1000
-        merged['itr_axis'] += [i + offset for i in lg['itr_axis']]
-        merged['loss'] += lg['loss']
-        merged['v_score'] += lg['v_score']
-        merged['n_drops'] += lg['n_drops']
-        merged['worst_BER'] += lg['worst_BER']
-        merged['bais_probability'] += lg['bais_probability']
-        for c in range(model.N_channels):
-            merged['BER_per_ch'][c] += lg['BER_per_ch'][c]
-            merged['n_relays_per_ch'][c] += lg['n_relays_per_ch'][c]
-            merged['w_norm_per_ch'][c] += lg['w_norm_per_ch'][c]
-            merged['b_norm_per_ch'][c] += lg['b_norm_per_ch'][c]
-            merged['p_entropy_per_ch'][c] += lg['p_entropy_per_ch'][c]
-
-    # Save merged raw data
-    torch.save(merged, os.path.join(path, 'data', 'stage2_all_epochs_raw.pt'))
-
-    # Cumulative plots (epoch = 0 → "all" label)
-    _plot_all(merged, z0, path, epoch="all")  # 0 → saved as e00_*.png  (= cumulative)
-
-    print("\nDone! stage 2 training")
-    print(f"  Plots saved to  {os.path.join(path, 'outputs')}")
-    print(f"  Raw data saved to {os.path.join(path, 'data')}")
+def lin2dB(x):
+    return 10 * torch.log10(torch.tensor(x))
 
 
-def stage_3(model, SNR_basic_trainning, SNR_max, SNR_step, max_iteration, BER_th, device, SNR_val,
-            path):
-    loss_fn_SC = Single_channel_loss_function
+def dB2lin(x):
+    if not torch.is_tensor(x):
+        x = torch.tensor(x)
+    return torch.pow(10, x / 10)
+
+
+def plotSNRvsBER(model, batch, SNR, stage, num_itr=1):
+    plt.close()
+    plt.clf()
+    plt.figure(figsize=(10, 6))
+    plt.style.use('classic')
+    # MATLAB-like color cycle
+    plt.rcParams['axes.prop_cycle'] = plt.cycler(color=['b', 'g', 'r', 'c', 'm', 'y', 'k'])
+
+    # Use Helvetica-like font
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    plt.rcParams['font.size'] = 12
+
+    plt.title('BER vs SNR - {}'.format(stage), fontsize=14)
+    plt.xlabel('SNR (dB)', fontsize=12)
+    plt.ylabel('BER (log scale)', fontsize=12)
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
+
+    worst_BER = torch.zeros((model.N_channels, SNR.shape[0]))
+    best_BER = torch.zeros((model.N_channels, SNR.shape[0]))
+    model.eval()
     for c in range(model.N_channels):
-        SNR = SNR_max
-        epochs = 0
-        flag_BER = False
-        optimizer = torch.optim.Adam(model.sub_networks[c].parameters(), lr=1e-3)
-        while True:
-            if not flag_BER:
-                print("stage 3 - channel {} -- Epoch {} - SNR: {:.2f}\n"
-                      "-------------------------------".format(c, epochs, SNR_basic_trainning))
-                BER, loss = model.train_single_channel(num_itr=1000, model_idx=c,
-                                                       loss_fn=loss_fn_SC, optimizer=optimizer,
-                                                       device=device, batch=512,
-                                                       SNR=SNR_basic_trainning, stage3=True)
-                epochs += 1
-                if np.mean(BER) == 0:
-                    epochs = 0
-                    flag_BER = True
-                    print("changed flag")
-                if epochs >= max_iteration:
-                    break
-            else:
-                print("stage 3 - channel {} -- Epoch {} - SNR: {:.2f}\n"
-                      "-------------------------------".format(c, epochs, SNR))
-                BER, loss = model.train_single_channel(num_itr=1000, model_idx=c,
-                                                       loss_fn=loss_fn_SC, optimizer=optimizer,
-                                                       device=device, batch=2 ** 7, SNR=SNR,
-                                                       stage3=True)
-                if np.mean(BER) < max(BER_th, 2 ** -7):
-                    SNR = SNR - SNR_step
-                    epochs = 0
-                if epochs >= max_iteration:
-                    break
-                epochs += 1
-            # print("testing")
-            # model.test_single_channel(model_idx=c, loss_fn=loss_fn_SC, device=device,
-            #                           batch=2 ** 7,
-            #                           SNR=torch.linspace(SNR_val - 10, SNR_val + 10, 21))
-    model.save(path, "stage_3")
-    print("Done! training")
+
+        for snr_idx, snr in enumerate(SNR):
+            model.sub_networks[c].SNR = dB2lin(snr)
+            for itr in range(num_itr):
+                signal,bits = model.sub_networks[c].modulator(batch )
+                # Compute prediction error
+                rm = model.sub_networks[c](signal,bits)
+                pred = model.sub_networks[c].demodulator(rm)
+                scalar_worst_BER, _, scalar_best_BER = model.sub_networks[c].BER(bits=bits, pred=pred)
+                # print(f"{signal.shape=}, {bits.shape=}, {rm.shape=}, {pred.shape=}")
+                worst_BER[c, snr_idx] += scalar_worst_BER
+                best_BER[c, snr_idx] += scalar_best_BER
+
+            worst_BER[c, snr_idx] /= num_itr
+            best_BER[c, snr_idx] /= num_itr
+
+            print("channel {} -- In valdation: SNR: {},  worst BER : {:.2E}, best BER : {:.2E}".format(c, snr,
+                                                                                                       worst_BER[
+                                                                                                           c, snr_idx],
+                                                                                                       best_BER[
+                                                                                                           c, snr_idx]))
+            if worst_BER[c, snr_idx] == 0:
+                break
+        plt.semilogy(SNR, worst_BER[c, :], '-o', label=f"channel {c} - worst")
+        # plt.semilogy(SNR, best_BER[c, :], '-o', label=f"channel {c} - best")
+
+    plt.legend(loc="lower left")
+    return worst_BER, best_BER
+
+
+def compere_all_stages(model, path, batch_size, SNR, num_itr=1):
+    markers = ['-o', '-^', '-D']
+    plt.figure(figsize=(10, 6))
+    plt.style.use('classic')
+
+    # MATLAB-like color cycle
+    plt.rcParams['axes.prop_cycle'] = plt.cycler(color=['b', 'g', 'r', 'c', 'm', 'y', 'k'])
+
+    # Use Helvetica-like font
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    plt.rcParams['font.size'] = 12
+
+    plt.title('Compare all the stages - worst BER ', fontsize=14)
+    plt.xlabel('SNR (dB)', fontsize=12)
+    plt.ylabel('BER (log scale)', fontsize=12)
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
+    torch.save(SNR, os.path.join(path, "outputs", "SNR.pt"))
+
+    with torch.no_grad():
+        for stage in range(1, 4):
+            model.load(path, f"stage_{stage}")
+            Worst_ber = torch.zeros((model.N_channels, SNR.shape[0]))
+            with torch.no_grad():
+                for c in range(model.N_channels):
+                    for snr_index, snr in enumerate(SNR):
+                        model.sub_networks[c].SNR = dB2lin(snr)
+
+                        for itr in range(num_itr):
+                            signal,bits = model.sub_networks[c].modulator(batch_size=batch_size)
+                            # Compute prediction error
+                            rm = model.sub_networks[c](signal,bits)
+                            pred = model.sub_networks[c].demodulator(rm)
+                            scalar_worst_BER, _, scalar_best_BER = model.sub_networks[c].BER(bits=bits, pred=pred)
+                            Worst_ber[c, snr_index] += scalar_worst_BER
+                        Worst_ber[c, snr_index] = Worst_ber[c, snr_index] / num_itr
+                        print(
+                            "stage {} -channel {} -- In valdation: SNR: {},  worst BER : {:.2E}".format(stage, c, snr,
+                                                                                                        Worst_ber[
+                                                                                                            c, snr_index]))
+                        if Worst_ber[c, snr_index] == 0:
+                            break
+                    torch.save(Worst_ber, os.path.join(path, "outputs", f"worst_BER_stage_{stage}.pt"))
+                    plt.semilogy(SNR, Worst_ber[c, :], markers[stage - 1], label=f"stage{stage} - channel {c}")
+
+    plt.legend(loc="lower left")
+    plt.savefig(os.path.join(path, "compare_3_stages.png"))
+    plt.clf()
+
+
+def plot_architecture(path, Name_of_model = None, stage="stage_2"):
+
+    posT = torch.load(os.path.join(path, "data", "posT.pt"), weights_only=False)
+    posR = torch.load(os.path.join(path, "data", "posR.pt"), weights_only=False)
+    posU = torch.load(os.path.join(path, "data", "posU.pt"), weights_only=False)
+
+
+    model = load_model(path)
+    if not Name_of_model is None:
+        model.load(os.path.join(path, Name_of_model), stage)
+    else:
+        model.load(path, stage)
+    N_channels = model.N_channels
+    color_RR = np.zeros((len(posR), 1))
+
+    model.update_v()
+    model.culc_p()
+    for c in range(N_channels):
+        pl = model.P[c]
+        color_RR[pl >= 0.5] = c + 1
+
+    colors = plt.get_cmap('jet', N_channels + 1)
+    plt.figure(figsize=(12, 10))
+    total_relay = 0
+    for c in range(N_channels):
+        plt.scatter(posT[c, 0], posT[c, 1], marker="$T$", label=f"GS - channel {c}", color=colors(c), s=200)
+        plt.scatter(posR[np.squeeze(color_RR == c + 1), 0], posR[np.squeeze(color_RR == c + 1), 1], marker='o',
+                    color=colors(c),
+                    label=f"relay - channel - {c}", s=200)
+        plt.scatter(posU[c][:, 0], posU[c][:, 1],
+                    marker="$R$", color=colors(c),
+                    label=f"user - channel - {c}", s=200)
+        total_relay+=posR[np.squeeze(color_RR == c + 1), 0].size()[0]
+    if total_relay != model.N_relays:
+        print("%%%%%%%%%%%%%%%%%%%%%%%%%" * 100)
+        print("heeeeeeeeeeeeeeeelllllllllllllllll nooooooooooooooooooooo")
+        print(f"there is an error in model {os.path.join(path, Name_of_model)}! as stage {stage}")
+        print("the total relays printed is not the same as model.N_relays")
+        print("%%%%%%%%%%%%%%%%%%%%%%%%%" * 100)
+    plt.xticks([])
+    plt.yticks([])
+    plt.legend(bbox_to_anchor=(0., 1.02, 1., .102), loc='lower left',
+               ncols=3 * N_channels, mode="expand", borderaxespad=0.)
+
+    if not Name_of_model is None:
+        plt.savefig(os.path.join(path, Name_of_model + "architecture.png"))
+    else:
+        plt.savefig(os.path.join(path, "architecture.png"))
+
+    plt.clf()
+
+
+def nested_list_to_tensor(nested_list):
+    """
+    Recursively convert a nested list of tensors into a PyTorch tensor.
+
+    Args:
+        nested_list: A nested list structure containing PyTorch tensors.
+
+    Returns:
+        A PyTorch tensor combining all the nested tensors.
+    """
+    # Base case: If the input is already a tensor, return it
+    if isinstance(nested_list, torch.Tensor):
+        return nested_list
+
+    # Recursive case: Apply the function to all elements in the list
+    stacked_list = [nested_list_to_tensor(sublist) for sublist in nested_list]
+
+    # Stack along a new dimension
+    return torch.stack(stacked_list)
+
+
+def check_for_nan_inf(tensor, name="Tensor"):
+    if torch.any(torch.isnan(tensor)):
+        print(f"{name} contains NaN!")
+        return True
+    if torch.any(torch.isinf(tensor)):
+        print(f"{name} contains Inf!")
+        return True
+    return False
+
+
+import scipy.io
+
+
+def save_var_with_name(var, name, prefix=''):
+    if isinstance(var, list):
+        for idx, elem in enumerate(var):
+            new_name = f"{name}_{idx}"
+            save_var_with_name(elem, new_name, prefix)
+    else:
+        filename = os.path.join(prefix, f"{name}.mat")
+        scipy.io.savemat(filename, {name: var})
+
+
+def int_to_binary(ints, num_bits):
+    # Create a mask for each bit position (e.g., [128, 64, 32, ..., 1])
+    mask = 2 ** torch.arange(num_bits - 1, -1, -1).to(ints.device)
+
+    # Use bitwise AND to check if each bit is set
+    # unsqueeze(-1) adds a new dimension to allow broadcasting
+    return (ints.unsqueeze(-1).bitwise_and(mask).ne(0)).to(torch.int)
+
+
+def plot_symbols(model, path):
+    fig, axes = plt.subplots(2, model.N_channels,
+                             figsize=(8 * model.N_channels, 8),
+                             squeeze=False)
+    cmap = plt.get_cmap("tab10")
+    for c in range(model.N_channels):
+        ax_tx = axes[0, c]
+        ax_rx = axes[1, c]
+
+        N_symbols = 2 ** model.N_users[c]
+        bits = int_to_binary(torch.arange(0, N_symbols), model.N_users[c]).to(torch.complex64)
+        if model.demod_type == "complex":
+            s = model.sub_networks[c].transmitNN(bits).detach()
+        else:
+            symbols_int = torch.sum(2 ** (torch.unsqueeze(torch.linspace(0, model.N_users[c] - 1, model.N_users[c]), dim=1)) * bits.T,
+                            dim=0)
+            s = model.sub_networks[c].modulation[symbols_int.real.to(torch.int32)]
+
+        print(f"for channel {c} the maximum amplitude is {torch.max(s.abs() ** 2).item()}")
+        rm = model.sub_networks[c](s,bits.T).detach().T
+        if model.demod_type == "simple":
+            s = torch.unsqueeze(s,dim=1)
+        # bits label per symbol: e.g. "01" for symbol 1 with 2 users
+        bits_labels = [
+            "".join(str(b) for b in int_to_binary(torch.tensor([sym]), model.N_users[c])[0].int().tolist())
+            for sym in range(N_symbols)
+        ]
+
+        # ── Transmitter output (top row) ──
+        for idx in range(model.N_tx):
+            color = cmap(idx)
+            ax_tx.scatter(s[:, idx].real, s[:, idx].imag, label=f"Tx {idx}", zorder=3,color=color)
+            for sym in range(N_symbols):
+                ax_tx.annotate(
+                    bits_labels[sym],
+                    (s[sym, idx].real.item(), s[sym, idx].imag.item()),
+                    textcoords="offset points", xytext=(5, 5),
+                    fontsize=8, fontweight="bold"
+                )
+        ax_tx.set_title(f"Channel {c} — Transmitter output")
+        ax_tx.set_xlabel("Real")
+        ax_tx.set_ylabel("Imag")
+        ax_tx.legend()
+        ax_tx.grid(True, linestyle="--", alpha=0.4)
+        ax_tx.axhline(0, color="gray", lw=0.5)
+        ax_tx.axvline(0, color="gray", lw=0.5)
+
+        # ── Receiver output (bottom row) ──
+        for idx in range(model.N_users[c]):
+            color= cmap(idx)
+            ax_rx.scatter(rm[:, idx].real, rm[:, idx].imag, label=f"User {idx}", zorder=3,color=color)
+            for sym in range(N_symbols):
+                ax_rx.annotate(
+                    bits_labels[sym],
+                    (rm[sym, idx].real.item(), rm[sym, idx].imag.item()),
+                    textcoords="offset points", xytext=(5, 5),
+                    fontsize=8, fontweight="bold"
+                )
+        ax_rx.set_title(f"Channel {c} — Receiver output")
+        ax_rx.set_xlabel("Real")
+        ax_rx.set_ylabel("Imag")
+        ax_rx.legend()
+        ax_rx.grid(True, linestyle="--", alpha=0.4)
+        ax_rx.axhline(0, color="gray", lw=0.5)
+        ax_rx.axvline(0, color="gray", lw=0.5)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(path, "symbols_Tx_Rx.png"))
+    plt.clf()
+
+
+def _fmt(seconds):
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{int(h):02}:{int(m):02}:{s:.2f}"

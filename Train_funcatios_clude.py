@@ -485,11 +485,11 @@ def stage_1(model, basic_training, SNR_basic_trainning, SNR_max, SNR_step, max_i
             max_snr_train = max(SNR, max_snr_train)
             print("Done! training")
 
-        torch.save(max_snr_train, path + "\\data\\max_snr_train_stage_1")
+        torch.save(max_snr_train, os.path.join(path, "data", "max_snr_train_stage_1"))
         model.save(path, "stage_1")
     else:
         model.load(path, "stage_1")
-        max_snr_train = torch.load(path + "\\data\\max_snr_train_stage_1", weights_only=True)
+        max_snr_train = torch.load(os.path.join(path, "data", "max_snr_train_stage_1"), weights_only=True)
 
     return max_snr_train
 

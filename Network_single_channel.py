@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,11 +24,11 @@ def save_var_with_name(var, name, prefix=''):
             new_name = f"{name}_{idx}"
             save_var_with_name(elem, new_name, prefix)
     elif isinstance(var, dict):
-        filename = f"{prefix}{name}.mat"
+        filename = os.path.join(prefix, f"{name}.mat")
         mdict = {str(k): _to_saveable(v) for k, v in var.items()}
         scipy.io.savemat(filename, mdict)
     else:
-        filename = f"{prefix}{name}.mat"
+        filename = os.path.join(prefix, f"{name}.mat")
         scipy.io.savemat(filename, {name: _to_saveable(var)})
 
 
@@ -287,7 +289,7 @@ class Network_single_channel(nn.Module):
                 "BN_args": self.BN_args,
                 "state_dict": self.state_dict()
             },
-            path + "\\models\\python\\" + Name
+            os.path.join(path, "models", "python", Name)
         )
 
     def save_dict_to_npz(self, tensor_dict, save_path):
@@ -297,15 +299,15 @@ class Network_single_channel(nn.Module):
 
     def save_matlab(self, path, Name):
         self.update_init_arges()
-        save_var_with_name(self.BN_args, Name + "BN_args", path + "\\models\\matlab\\")
-        save_var_with_name(self.state_dict(), Name + "state_dict", path + "\\models\\matlab\\")
+        save_var_with_name(self.BN_args, Name + "BN_args", os.path.join(path, "models", "matlab"))
+        save_var_with_name(self.state_dict(), Name + "state_dict", os.path.join(path, "models", "matlab"))
 
-        # self.save_dict_to_npz(self._init_args, path + "\\models\\matlab\\" + Name + "_init_arges.mat")
-        # self.save_dict_to_npz(self.BN_args, path + "\\models\\matlab\\" + Name + "BN_args.mat")
-        # self.save_dict_to_npz(self.state_dict(), path + "\\models\\matlab\\" + Name + "state_dict.mat")
+        # self.save_dict_to_npz(self._init_args, os.path.join(path, "models", "matlab", Name + "_init_arges.mat"))
+        # self.save_dict_to_npz(self.BN_args, os.path.join(path, "models", "matlab", Name + "BN_args.mat"))
+        # self.save_dict_to_npz(self.state_dict(), os.path.join(path, "models", "matlab", Name + "state_dict.mat"))
 
     def load(self, path, Name, device=None):
-        checkpoint = torch.load(path + "\\models\\python\\" + Name, map_location=device, weights_only=False)
+        checkpoint = torch.load(os.path.join(path, "models", "python", Name), map_location=device, weights_only=False)
         self.load_state_dict(checkpoint["state_dict"])
         dev = self.w.device
         BN_arc = checkpoint["BN_args"]["BN"]
