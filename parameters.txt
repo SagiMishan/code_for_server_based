@@ -1,0 +1,25 @@
+Name_of_model: compare_networks
+start_from_zero: True
+random_network: True
+does_stage_1: True
+does_stage_2: True
+does_stage_3: True
+demod_type: complex
+N_transmitter: 2
+N_relays: 100
+N_users: [2, 2]
+N_channels: 2
+N_rx: 1
+N_tx: 1
+d_spacing: 0.1
+SNR_basic_trainning: 50.0
+SNR_max: 00.0
+max_iteration: 10
+SNR_step: 1.0
+BER_th: 0.001
+epochs: 100
+z0_type: exp
+z0_init: 0.1
+z0_end: 0.1
+B: 10.0
+sub_stages: [0.4, 0.5, 0.1]
