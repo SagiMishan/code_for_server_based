@@ -1,1746 +1,48 @@
-# """
-# compare_models.py
-# =================
-# Two-tab GUI tool for offline model analysis.
-#
-# Tab 1 – BER Comparison
-#     Load trained model folders, evaluate BER vs SNR, overlay results.
-#
-# Tab 2 – Log Comparison
-#     Load stage-2 log .pt files (stage2_all_epochs_raw.pt) from one or more
-#     models and overlay any logged metric on a single graph.
-#     Special case: when only ONE model is loaded, two log files from that
-#     model can be selected and plotted together (e.g. two training runs).
-# """
-#
-# import os
-# import sys
-# import tkinter as tk
-# from tkinter import ttk, filedialog, messagebox
-#
-# import matplotlib
-# matplotlib.use("TkAgg")
-# import matplotlib.pyplot as plt
-# from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-# import numpy as np
-# import torch
-#
-# _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
-# if _SRC_DIR not in sys.path:
-#     sys.path.insert(0, _SRC_DIR)
-#
-# from Network_multy_channels import Network_multy_channel  # noqa: E402
-#
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Constants
-# # ─────────────────────────────────────────────────────────────────────────────
-#
-# MARKERS = ['o', '^', 'D', 's', 'P', '*', 'X', 'v', '<', '>']
-# COLORS  = plt.rcParams['axes.prop_cycle'].by_key()['color']
-#
-# # All keys present in the log dict that can be plotted.
-# # (channel-indexed ones are expanded dynamically after loading)
-# LOG_SCALAR_KEYS = ['loss', 'v_score', 'n_drops', 'worst_BER']
-# LOG_PER_CH_KEYS = ['BER_per_ch', 'n_relays_per_ch',
-#                    'w_norm_per_ch', 'b_norm_per_ch', 'p_entropy_per_ch']
-#
-# METRIC_LABELS = {
-#     'loss':           'Total loss',
-#     'v_score':        'V score',
-#     'n_drops':        'Weight drops / 100 itr',
-#     'worst_BER':      'Worst BER (all channels)',
-#     'BER_per_ch':     'Worst BER',
-#     'n_relays_per_ch':'Active relays (P>0.9)',
-#     'w_norm_per_ch':  'Mean |w|',
-#     'b_norm_per_ch':  'Mean |b|',
-#     'p_entropy_per_ch':'P entropy (nats)',
-# }
-#
-# USE_LOG_SCALE = {'worst_BER', 'BER_per_ch'}
-#
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Shared utility
-# # ─────────────────────────────────────────────────────────────────────────────
-#
-# def read_max_snr_stage1(model_folder: str) -> float | None:
-#     """
-#     Read max_snr_train_stage_1.pt from <model_folder>/data/.
-#     Returns the float value, or None if the file doesn't exist.
-#     """
-#     path = os.path.join(model_folder, 'data', 'max_snr_train_stage_1.pt')
-#     if not os.path.isfile(path):
-#         return None
-#     try:
-#         val = torch.load(path, weights_only=True)
-#         return float(val)
-#     except Exception:
-#         return None
-#
-#
-# # ─────────────────────────────────────────────────────────────────────────────
-# # BER helpers  (unchanged from original)
-# # ─────────────────────────────────────────────────────────────────────────────
-#
-# def dB2lin(x):
-#     if not torch.is_tensor(x):
-#         x = torch.tensor(float(x))
-#     return torch.pow(10.0, x / 10.0)
-#
-#
-# def load_model(path, stage):
-#     def _pt(name):
-#         return torch.load(os.path.join(path, 'data', name + '.pt'), weights_only=True)
-#     MatcgRR           = _pt('MatcgRR')
-#     MatcgSR           = _pt('MatcgSR')
-#     cgRU              = _pt('cgRU')
-#     connectaionMatrix = _pt('connectaionMatrix')
-#     N_users           = _pt('N_users')
-#     N_channels        = int(_pt('N_channels'))
-#     N_relays          = int(_pt('N_relays'))
-#     demod_type        = _pt('demod_type')
-#     N_rx             = _pt('N_rx')
-#     N_tx            = _pt('N_tx')
-#     cgTU             = _pt('cgTU')
-#     modCode_order     = [2 ** int(n) for n in N_users]
-#     model = Network_multy_channel(N_users=N_users,
-#                                   N_relays=N_relays,
-#                                   N_channels=N_channels,
-#                                   connectaionMatrix=connectaionMatrix,
-#                                   MatcgSR=MatcgSR,
-#                                   MatcgRR=MatcgRR,
-#                                   MatcgRU=cgRU,
-#                                   MatcgTU=cgTU,
-#                                   modCode_order=modCode_order,
-#                                   demod_type=demod_type,
-#                                   N_rx=N_rx,
-#                                   N_tx=N_tx
-#                                   )
-#     model.load(path + '\\', f'stage_{stage}')
-#     model.eval()
-#     return model
-#
-#
-# def evaluate_model(model, snr_range, batch, num_itr):
-#     C   = model.N_channels
-#     out = torch.zeros(C, len(snr_range))
-#     with torch.no_grad():
-#         for c in range(C):
-#             for si, snr in enumerate(snr_range):
-#                 snr_lin = dB2lin(snr)
-#                 model.sub_networks[c].SNR = snr_lin
-#                 acc = 0.0
-#                 for _ in range(num_itr):
-#                     signal,bits = model.sub_networks[c].modulator(batch)
-#                     rm   = model.sub_networks[c](signal,bits)
-#                     pred = model.sub_networks[c].demodulator(rm)
-#                     worst, _, _ = model.sub_networks[c].BER(bits=bits, pred=pred)
-#                     acc += float(worst)
-#                 out[c, si] = acc / num_itr
-#                 print(f'  ch{c} SNR={snr:.1f} dB  BER={out[c,si]:.3e}')
-#                 if out[c, si] == 0:
-#                     break
-#     return out
-#
-#
-# def plot_ber_comparison(results, snr_range, save_path=None, show=True):
-#     fig, ax = plt.subplots(figsize=(11, 6))
-#     ax.set_title('BER vs SNR — model comparison', fontsize=14)
-#     ax.set_xlabel('SNR (dB)', fontsize=12)
-#     ax.set_ylabel('BER (log scale)', fontsize=12)
-#     ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
-#     snr_np    = snr_range.numpy()
-#     color_idx = 0
-#     for entry in results:
-#         name  = entry['name']
-#         stage = entry['stage']
-#         ber   = entry['ber']
-#         C     = ber.shape[0]
-#         color  = COLORS[color_idx % len(COLORS)]
-#         marker = MARKERS[color_idx % len(MARKERS)]
-#         color_idx += 1
-#         if C == 1:
-#             ax.semilogy(snr_np, ber[0].numpy(), marker=marker,
-#                         color=color, linewidth=1.8, markersize=5,
-#                         label=f'{name}  (stage {stage})')
-#         else:
-#             worst_overall = ber.max(dim=0).values.numpy()
-#             ax.semilogy(snr_np, worst_overall, marker=marker,
-#                         color=color, linewidth=2, markersize=5,
-#                         label=f'{name}  (stage {stage}, worst ch)')
-#             for c in range(C):
-#                 ax.semilogy(snr_np, ber[c].numpy(), linestyle='--',
-#                             color=color, linewidth=0.9, alpha=0.55,
-#                             label=f'{name}  (stage {stage}, ch{c})')
-#     ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1),
-#               borderaxespad=0, fontsize=9)
-#     fig.tight_layout(rect=[0, 0, 0.78, 1])
-#     if save_path:
-#         fig.savefig(save_path, bbox_inches='tight', dpi=150)
-#         print(f'Plot saved to {save_path}')
-#     if show:
-#         plt.show()
-#     else:
-#         plt.close(fig)
-#
-#
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Log helpers
-# # ─────────────────────────────────────────────────────────────────────────────
-#
-# def load_log(filepath):
-#     """Load a stage2_all_epochs_raw.pt log dict."""
-#     data = torch.load(filepath, weights_only=False)
-#     # unwrap if saved inside a wrapper dict (stage2_epochXX_raw.pt format)
-#     if 'log' in data and isinstance(data['log'], dict):
-#         data = data['log']
-#     return data
-#
-#
-# def expand_metric_names(log):
-#     """
-#     Return a list of (display_name, key, channel_or_None) tuples
-#     for every plottable series in the log.
-#     """
-#     names = []
-#     for k in LOG_SCALAR_KEYS:
-#         if k in log:
-#             names.append((METRIC_LABELS.get(k, k), k, None))
-#     for k in LOG_PER_CH_KEYS:
-#         if k in log:
-#             ch_dict = log[k]
-#             for c in sorted(ch_dict.keys()):
-#                 display = f'{METRIC_LABELS.get(k, k)} — ch {c}'
-#                 names.append((display, k, c))
-#     return names
-#
-#
-# def get_series(log, key, channel):
-#     """Extract (itr_array, values_array) from a log dict."""
-#     itr = np.array(log['itr_axis'])
-#     if channel is None:
-#         vals = np.array(log[key], dtype=float)
-#     else:
-#         vals = np.array(log[key][channel], dtype=float)
-#     return itr, vals
-#
-#
-# def plot_log_comparison(entries, metric_key, metric_channel,
-#                         window=10, save_path=None, show=True):
-#     """
-#     entries : list of {label, log}
-#     metric_key / metric_channel : which series to plot
-#     """
-#     use_log  = metric_key in USE_LOG_SCALE
-#     ma_kern  = np.ones(window) / window
-#     fig, ax  = plt.subplots(figsize=(12, 5))
-#     title    = METRIC_LABELS.get(metric_key, metric_key)
-#     if metric_channel is not None:
-#         title += f' — ch {metric_channel}'
-#     ax.set_title(title, fontsize=13)
-#     ax.set_xlabel('Iteration')
-#     ax.set_ylabel(title)
-#     ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.6)
-#
-#     plot_fn = ax.semilogy if use_log else ax.plot
-#     color_idx = 0
-#
-#     for entry in entries:
-#         label = entry['label']
-#         log   = entry['log']
-#         color  = COLORS[color_idx % len(COLORS)]
-#         marker = MARKERS[color_idx % len(MARKERS)]
-#         color_idx += 1
-#
-#         itr, vals = get_series(log, metric_key, metric_channel)
-#         # mask zeros for log-scale plots
-#         if use_log:
-#             vals = np.where(vals == 0, np.nan, vals)
-#
-#         plot_fn(itr, vals, color=color, alpha=0.3, linewidth=1)
-#         valid = ~np.isnan(vals)
-#         if valid.sum() >= window:
-#             ma = np.convolve(vals[valid], ma_kern, mode='valid')
-#             plot_fn(itr[valid][window - 1:], ma,
-#                     color=color, linewidth=2,
-#                     marker=marker, markevery=max(1, len(ma)//15),
-#                     markersize=5, label=label)
-#         else:
-#             plot_fn(itr[valid], vals[valid], color=color,
-#                     linewidth=2, marker=marker, markersize=5, label=label)
-#
-#     ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1),
-#               borderaxespad=0, fontsize=9)
-#     fig.tight_layout(rect=[0, 0, 0.80, 1])
-#     if save_path:
-#         fig.savefig(save_path, bbox_inches='tight', dpi=150)
-#         print(f'Log plot saved to {save_path}')
-#     if show:
-#         plt.show()
-#     else:
-#         plt.close(fig)
-#
-#
-# def _plot_dual_metric(entry, m1_key, m1_ch, m2_key, m2_ch,
-#                       window=10, save_path=None, show=True):
-#     """
-#     Plot two metrics from a single log on twin y-axes.
-#     Left axis  = metric 1 (blue tones)
-#     Right axis = metric 2 (orange tones)
-#     """
-#     log      = entry['log']
-#     label    = entry['label']
-#     ma_kern  = np.ones(window) / window
-#
-#     itr = np.array(log['itr_axis'])
-#
-#     def _prep(key, ch):
-#         _, vals = get_series(log, key, ch)
-#         if key in USE_LOG_SCALE:
-#             vals = np.where(vals == 0, np.nan, vals)
-#         return vals
-#
-#     v1 = _prep(m1_key, m1_ch)
-#     v2 = _prep(m2_key, m2_ch)
-#
-#     t1 = METRIC_LABELS.get(m1_key, m1_key) + (f' — ch {m1_ch}' if m1_ch is not None else '')
-#     t2 = METRIC_LABELS.get(m2_key, m2_key) + (f' — ch {m2_ch}' if m2_ch is not None else '')
-#
-#     fig, ax1 = plt.subplots(figsize=(12, 5))
-#     fig.suptitle(f'{label}', fontsize=12)
-#
-#     c1 = COLORS[0]   # blue family
-#     c2 = COLORS[1]   # orange family
-#
-#     # ── left axis ─────────────────────────────────────────────────────────────
-#     pf1 = ax1.semilogy if m1_key in USE_LOG_SCALE else ax1.plot
-#     ax1.set_xlabel('Iteration')
-#     ax1.set_ylabel(t1, color=c1)
-#     ax1.tick_params(axis='y', labelcolor=c1)
-#
-#     pf1(itr, v1, color=c1, alpha=0.25, linewidth=1)
-#     valid1 = ~np.isnan(v1)
-#     if valid1.sum() >= window:
-#         ma1 = np.convolve(v1[valid1], ma_kern, mode='valid')
-#         pf1(itr[valid1][window - 1:], ma1, color=c1, linewidth=2,
-#             marker='o', markevery=max(1, len(ma1) // 15),
-#             markersize=5, label=t1)
-#     else:
-#         pf1(itr[valid1], v1[valid1], color=c1, linewidth=2, label=t1)
-#
-#     # ── right axis ────────────────────────────────────────────────────────────
-#     ax2 = ax1.twinx()
-#     pf2 = ax2.semilogy if m2_key in USE_LOG_SCALE else ax2.plot
-#     ax2.set_ylabel(t2, color=c2)
-#     ax2.tick_params(axis='y', labelcolor=c2)
-#
-#     pf2(itr, v2, color=c2, alpha=0.25, linewidth=1)
-#     valid2 = ~np.isnan(v2)
-#     if valid2.sum() >= window:
-#         ma2 = np.convolve(v2[valid2], ma_kern, mode='valid')
-#         pf2(itr[valid2][window - 1:], ma2, color=c2, linewidth=2,
-#             linestyle='--', marker='^',
-#             markevery=max(1, len(ma2) // 15),
-#             markersize=5, label=t2)
-#     else:
-#         pf2(itr[valid2], v2[valid2], color=c2, linewidth=2,
-#             linestyle='--', label=t2)
-#
-#     # combined legend outside
-#     h1, l1 = ax1.get_legend_handles_labels()
-#     h2, l2 = ax2.get_legend_handles_labels()
-#     ax1.legend(h1 + h2, l1 + l2, loc='upper left',
-#                bbox_to_anchor=(1.08, 1), borderaxespad=0, fontsize=9)
-#
-#     ax1.grid(True, which='both', linestyle='--', linewidth=0.4, alpha=0.6)
-#     fig.tight_layout(rect=[0, 0, 0.80, 1])
-#
-#     if save_path:
-#         fig.savefig(save_path, bbox_inches='tight', dpi=150)
-#         print(f'Dual-metric plot saved to {save_path}')
-#     if show:
-#         plt.show()
-#     else:
-#         plt.close(fig)
-#
-#
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Variation helpers  (Tab 3)
-# # ─────────────────────────────────────────────────────────────────────────────
-#
-# def discover_subfolders(main_folder: str) -> list[str]:
-#     """
-#     Return sorted list of immediate sub-folder names inside *main_folder*
-#     that contain at least one model with outputs/SNR.pt + outputs/worst_BER.pt.
-#     """
-#     result = []
-#     if not os.path.isdir(main_folder):
-#         return result
-#     for name in sorted(os.listdir(main_folder)):
-#         path = os.path.join(main_folder, name)
-#         if not os.path.isdir(path):
-#             continue
-#         for model_name in os.listdir(path):
-#             out = os.path.join(path, model_name, 'outputs')
-#             if (os.path.isfile(os.path.join(out, 'SNR.pt')) and
-#                     os.path.isfile(os.path.join(out, 'worst_BER.pt'))):
-#                 result.append(name)
-#                 break
-#     return result
-#
-#
-# def discover_models_in_subfolders(main_folder: str,
-#                                    subfolders: list[str]) -> list[dict]:
-#     """
-#     For each sub-folder name in *subfolders*, walk its model directories and
-#     collect every model that has outputs/SNR.pt + outputs/worst_BER.pt.
-#
-#     Returns a list of dicts:
-#         { 'label':        '<subfolder> / <model_name>',
-#           'outputs_path': full path to the outputs folder }
-#     """
-#     found = []
-#     for sf in subfolders:
-#         sfp = os.path.join(main_folder, sf)
-#         if not os.path.isdir(sfp):
-#             continue
-#         for model_name in sorted(os.listdir(sfp)):
-#             vmp = os.path.join(sfp, model_name)
-#             if not os.path.isdir(vmp):
-#                 continue
-#             out = os.path.join(vmp, 'outputs')
-#             if (os.path.isfile(os.path.join(out, 'SNR.pt')) and
-#                     os.path.isfile(os.path.join(out, 'worst_BER.pt'))):
-#                 found.append({'label': f'{sf} / {model_name}',
-#                               'outputs_path': out})
-#     return found
-#
-#
-# def load_variation_ber(outputs_path: str,
-#                        snr_targets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-#     """
-#     Load SNR.pt and worst_BER.pt from *outputs_path*.
-#     For each value in *snr_targets* find the closest recorded SNR point and
-#     return matched (snr_matched, ber_matched) arrays.
-#
-#     worst_BER.pt may be shape [N_snr] or [N_channels, N_snr]; the latter is
-#     reduced to the worst channel (max over axis 0).
-#     """
-#     snr_raw = torch.load(os.path.join(outputs_path, 'SNR.pt'), weights_only=True)
-#     ber_raw = torch.load(os.path.join(outputs_path, 'worst_BER.pt'), weights_only=True)
-#
-#     snr_np = (snr_raw.numpy() if torch.is_tensor(snr_raw) else np.array(snr_raw)).flatten()
-#     ber_np = (ber_raw.numpy() if torch.is_tensor(ber_raw) else np.array(ber_raw))
-#     if ber_np.ndim == 2:
-#         ber_np = ber_np.max(axis=0)
-#     ber_np = ber_np.flatten()
-#
-#     matched_snr, matched_ber = [], []
-#     for t in snr_targets:
-#         idx = int(np.argmin(np.abs(snr_np - t)))
-#         matched_snr.append(snr_np[idx])
-#         matched_ber.append(ber_np[idx])
-#     return np.array(matched_snr), np.array(matched_ber)
-#
-#
-# def plot_variation_all(results: list[dict], main_bers=None, save_path=None, show=True):
-#     """
-#     Plot every individual model BER curve, plus optionally the main model.
-#     results:  list of { 'label', 'snr': np.ndarray, 'ber': np.ndarray }
-#     main_bers: list of { 'label', 'snr': np.ndarray, 'ber': np.ndarray } or None
-#
-#     Paper-ready formatting:
-#       • Double-column IEEE width (7 in × 4.5 in)
-#       • Legend inside the axes (upper right) — ncol=2 if many entries
-#       • Font sizes matching a 10 pt document
-#       • 300 dpi / vector-friendly tight layout
-#     To adjust: change PAPER_W/PAPER_H, FONT_* constants, or legend loc/ncol below.
-#     """
-#     # ── paper layout constants ── tweak these to taste ──────────────────────
-#     PAPER_W   = 7.0          # figure width  in inches (3.5 = single col, 7 = double col)
-#     PAPER_H   = 4.5          # figure height in inches
-#     FONT_AX   = 11           # axis-label font size
-#     FONT_TICK = 10           # tick-label font size
-#     FONT_LEG  = 8            # legend font size
-#     SAVE_DPI  = 300          # resolution for raster formats (png); irrelevant for pdf/eps
-#     LEG_LOC   = 'upper right'  # legend anchor inside the axes
-#     LEG_NCOL  = 2            # legend columns (increase to fit more entries per row)
-#     # ────────────────────────────────────────────────────────────────────────
-#
-#     fig, ax = plt.subplots(figsize=(PAPER_W, PAPER_H))
-#     ax.set_xlabel('SNR (dB)', fontsize=FONT_AX)
-#     ax.set_ylabel('Worst BER', fontsize=FONT_AX)
-#     ax.tick_params(axis='both', labelsize=FONT_TICK)
-#     ax.grid(True, which='both', linestyle='--', linewidth=0.4, alpha=0.6)
-#     print(f"found {len(results)} models to compare")
-#
-#     for i, entry in enumerate(results):
-#         color  = COLORS[i % len(COLORS)]
-#         marker = MARKERS[i % len(MARKERS)]
-#         snr, ber = entry['snr'], entry['ber']
-#         mask = ber > 0
-#         y   = ber if mask.any() else np.full_like(ber, 1e-9)
-#         lbl = entry['label'] if mask.any() else entry['label'] + '  (all zeros)'
-#         ax.semilogy(snr[mask] if mask.any() else snr,
-#                     y[mask]   if mask.any() else y,
-#                     marker=marker, color=color, linewidth=1.5,
-#                     markersize=4, label=lbl)
-#
-#     ylim = 1e-10
-#     main_styles = [
-#         dict(color='black',   linestyle='-',  marker='o'),
-#         dict(color='dimgray', linestyle='--', marker='s'),
-#     ]
-#     for j, mb in enumerate(main_bers or []):
-#         snr, ber = mb['snr'], mb['ber']
-#         ber_plot = np.where(ber > 0, ber, np.nan)
-#         if ~np.isnan(ber_plot).all():
-#             ylim = max(ylim, ber_plot[~np.isnan(ber_plot)].min())
-#         st = main_styles[j % len(main_styles)]
-#         ax.semilogy(snr, ber_plot, linewidth=2.0, markersize=5,
-#                     label=mb['label'], zorder=5, **st)
-#
-#     ax.set_ylim([ylim, 1])
-#     ax.legend(loc=LEG_LOC, ncol=LEG_NCOL, fontsize=FONT_LEG,
-#               handlelength=1.5, handletextpad=0.4, labelspacing=0.3,
-#               columnspacing=1.0, framealpha=0.85)
-#     fig.tight_layout()
-#
-#     if save_path:
-#         fig.savefig(save_path, bbox_inches='tight', dpi=SAVE_DPI)
-#         print(f'All-models plot saved to {save_path}')
-#     if show:
-#         plt.show()
-#     else:
-#         plt.close(fig)
-#
-#
-# def plot_variation_envelope(folder_results: list[dict], main_bers=None, save_path=None, show=True):
-#     """
-#     For each sub-folder plot worst/best BER envelope with filled area.
-#     Single-model folders draw one line (no best/worst suffix).
-#
-#     folder_results: list of {
-#         'label':   sub-folder name,
-#         'snr':     np.ndarray  [N_snr],
-#         'ber_mat': np.ndarray  [N_models, N_snr]
-#     }
-#
-#     Paper-ready formatting:
-#       • Double-column IEEE width (7 in × 4.5 in)
-#       • Legend inside the axes — ncol=2 keeps it compact for two-column papers
-#       • Font sizes matching a 10 pt document
-#       • 300 dpi tight layout
-#     To adjust: change PAPER_W/PAPER_H, FONT_* constants, or LEG_LOC/LEG_NCOL below.
-#     """
-#     # ── paper layout constants ── tweak these to taste ──────────────────────
-#     PAPER_W   = 7.0          # figure width  in inches (3.5 = single col, 7 = double col)
-#     PAPER_H   = 4.5          # figure height in inches
-#     FONT_AX   = 11           # axis-label font size
-#     FONT_TICK = 10           # tick-label font size
-#     FONT_LEG  = 8            # legend font size
-#     SAVE_DPI  = 300          # dpi for raster formats; irrelevant for pdf/eps
-#     LEG_LOC   = 'upper right'  # legend anchor inside the axes
-#     LEG_NCOL  = 2            # legend columns (increase if many entries)
-#     # ────────────────────────────────────────────────────────────────────────
-#
-#     import warnings
-#     fig, ax = plt.subplots(figsize=(PAPER_W, PAPER_H))
-#     ax.set_xlabel('SNR (dB)', fontsize=FONT_AX)
-#     ax.set_ylabel('Worst BER', fontsize=FONT_AX)
-#     ax.tick_params(axis='both', labelsize=FONT_TICK)
-#     ax.grid(True, which='both', linestyle='--', linewidth=0.4, alpha=0.6)
-#     print(f"found {len(folder_results)} sub-folders to compare")
-#
-#     for i, entry in enumerate(folder_results):
-#         color    = COLORS[i % len(COLORS)]
-#         snr      = entry['snr']
-#         mat      = entry['ber_mat']
-#         n_models = mat.shape[0]
-#
-#         mat_safe = np.where(mat > 0, mat, np.nan)
-#
-#         all_nan_cols = np.all(np.isnan(mat_safe), axis=0)
-#         if all_nan_cols.any():
-#             bad_snr = snr[all_nan_cols]
-#             print(f'  Warning [{entry["label"]}]: all models have BER=0 '
-#                   f'at SNR = {bad_snr} dB — those points will be skipped.')
-#
-#         with warnings.catch_warnings():
-#             warnings.filterwarnings('ignore', category=RuntimeWarning,
-#                                     message='All-NaN slice encountered')
-#             worst = np.nanmax(mat_safe, axis=0)
-#             best  = np.nanmin(mat_safe, axis=0)
-#
-#         valid = ~(np.isnan(worst) | np.isnan(best))
-#
-#         if n_models == 1:
-#             ax.semilogy(snr[valid], worst[valid], color=color, linewidth=1.5,
-#                         marker='o', markersize=4, markevery=1,
-#                         label=entry['label'])
-#         else:
-#             ax.semilogy(snr[valid], worst[valid], color=color, linewidth=1.5,
-#                         marker='^', markersize=4, markevery=1,
-#                         label=f'{entry["label"]}  worst')
-#             ax.semilogy(snr[valid], best[valid], color=color, linewidth=1.5,
-#                         linestyle='--', marker='v', markersize=4, markevery=1,
-#                         label=f'{entry["label"]}  best')
-#             if valid.any():
-#                 ax.fill_between(snr[valid], best[valid], worst[valid],
-#                                 color=color, alpha=0.18)
-#
-#     ylim = 1e-10
-#     main_styles = [
-#         dict(color='black',   linestyle='-',  marker='o'),
-#         dict(color='dimgray', linestyle='--', marker='s'),
-#     ]
-#     for j, mb in enumerate(main_bers or []):
-#         snr, ber = mb['snr'], mb['ber']
-#         ber_plot = np.where(ber > 0, ber, np.nan)
-#         if ~np.isnan(ber_plot).all():
-#             ylim = max(ylim, ber_plot[~np.isnan(ber_plot)].min())
-#         st = main_styles[j % len(main_styles)]
-#         ax.semilogy(snr, ber_plot, linewidth=2.0, markersize=5,
-#                     label=mb['label'], zorder=5, **st)
-#
-#     ax.set_ylim([ylim, 1])
-#     ax.legend(loc=LEG_LOC, ncol=LEG_NCOL, fontsize=FONT_LEG,
-#               handlelength=1.5, handletextpad=0.4, labelspacing=0.3,
-#               columnspacing=1.0, framealpha=0.85)
-#     fig.tight_layout()
-#
-#     if save_path:
-#         fig.savefig(save_path, bbox_inches='tight', dpi=SAVE_DPI)
-#         print(f'Envelope plot saved to {save_path}')
-#     if show:
-#         plt.show()
-#     else:
-#         plt.close(fig)
-#
-#
-#
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Architecture & Constellation helpers  (Tab 4)
-# # ─────────────────────────────────────────────────────────────────────────────
-#
-# def int_to_binary(integers, n_bits):
-#     """Convert integer tensor to binary matrix [N, n_bits] MSB-first."""
-#     mask = 2 ** torch.arange(n_bits - 1, -1, -1)
-#     return ((integers.unsqueeze(-1) & mask) > 0).int()
-#
-#
-# def plot_architecture(model, folder_path, save_path=None, show=True):
-#     """
-#     Spatial scatter plot.
-#     TX  — upward triangle  (^)  large, with black edge
-#     RX  — downward triangle (v)  large, with black edge
-#     Relay — circle (o)
-#     Each channel gets a distinct jet color. Relays colored by dominant channel (P >= 0.5).
-#     """
-#     def _pt(name):
-#         return torch.load(os.path.join(folder_path, 'data', name + '.pt'),
-#                           weights_only=False)
-#
-#     posT = _pt('posT')
-#     posR = _pt('posR')
-#     posU = _pt('posU')
-#
-#     C        = model.N_channels
-#     N_relays = model.N_relays
-#
-#     model.update_v()
-#     model.culc_p()
-#
-#     color_RR = np.zeros((N_relays, 1))
-#     for c in range(C):
-#         pl = model.P[c]
-#         color_RR[pl.detach().numpy() >= 0.5] = c + 1
-#
-#     colors = plt.get_cmap('jet', C + 1)
-#     fig    = plt.figure(figsize=(12, 10))
-#
-#     for c in range(C):
-#         col = colors(c)
-#
-#         plt.scatter(float(posT[c, 0]), float(posT[c, 1]),
-#                     marker='^', label=f'TX - channel {c}',
-#                     color=col, s=300, zorder=5,
-#                     edgecolors='black', linewidths=0.6)
-#
-#         mask = np.squeeze(color_RR == c + 1)
-#         if mask.any():
-#             plt.scatter(posR[mask, 0].numpy(), posR[mask, 1].numpy(),
-#                         marker='o', color=col,
-#                         label=f'relay - channel - {c}', s=200, zorder=3,
-#                         edgecolors='black', linewidths=0.4)
-#
-#         pu = posU[c]
-#         pu_np = pu.numpy() if torch.is_tensor(pu) else np.array(pu)
-#         if pu_np.ndim == 1:
-#             pu_np = pu_np.reshape(1, -1)
-#         plt.scatter(pu_np[:, 0], pu_np[:, 1],
-#                     marker='v', color=col,
-#                     label=f'RX - channel - {c}', s=300, zorder=5,
-#                     edgecolors='black', linewidths=0.6)
-#
-#     plt.xticks([])
-#     plt.yticks([])
-#     plt.legend(bbox_to_anchor=(0., 1.02, 1., .102), loc='lower left',
-#                ncols=3 * C, mode='expand', borderaxespad=0.)
-#     plt.tight_layout()
-#
-#     if save_path:
-#         fig.savefig(save_path, bbox_inches='tight', dpi=150)
-#         print(f'Architecture plot saved to {save_path}')
-#     if show:
-#         plt.show()
-#     else:
-#         plt.close(fig)
-#
-#
-# def plot_constellation(model, snr_db=10.0, n_itr=1, save_path=None, show=True):
-#     """
-#     One figure per channel, one figure per RX user within that channel.
-#
-#     Figure 1 — TX antennas (one subplot per antenna, side by side):
-#         Shows the transmitted constellation with bit-string labels.
-#
-#     Figure 2..N_users+1 — per RX user:
-#         Grid of N_symbols subplots (one per transmitted symbol).
-#         Each cell shows the received cloud for that specific symbol only,
-#         so overlapping symbols are split apart into separate panels.
-#         Color inside each panel = transmit symbol color (consistent with TX figure).
-#
-#     n_itr > 1 stacks multiple noisy passes to show the full noise cloud.
-#     """
-#     import matplotlib.patches as mpatches
-#     import math as _math
-#
-#     snr_lin  = dB2lin(snr_db)
-#     C        = model.N_channels
-#     sym_cmap = plt.get_cmap('tab20')
-#
-#     for c in range(C):
-#         sub       = model.sub_networks[c]
-#         sub.SNR   = snr_lin
-#         N_users_c = int(model.N_users[c])
-#         N_symbols = 2 ** N_users_c
-#
-#         # ── build symbol set ──────────────────────────────────────────────────
-#         bits = int_to_binary(torch.arange(0, N_symbols), N_users_c).to(torch.complex64)
-#         if model.demod_type == 'complex':
-#             s = sub.transmitNN(bits).detach()
-#         else:
-#             symbols_int = torch.sum(
-#                 2 ** torch.unsqueeze(
-#                     torch.linspace(0, N_users_c - 1, N_users_c), dim=1)
-#                 * bits.T, dim=0
-#             ).real.to(torch.int32)
-#             s = sub.modulation[symbols_int]   # [N_symbols] complex
-#
-#         print(f'Channel {c}: max TX amplitude^2 = {torch.max(s.abs() ** 2).item():.4f}')
-#
-#         s_plot = s.unsqueeze(1) if model.demod_type == 'simple' else s
-#         if s_plot.ndim == 1:
-#             s_plot = s_plot.unsqueeze(1)
-#         N_tx_plot = s_plot.shape[1]
-#
-#         # ── forward passes ────────────────────────────────────────────────────
-#         rm_runs = []
-#         with torch.no_grad():
-#             for _ in range(n_itr):
-#                 if model.demod_type == 'complex':
-#                     rm = sub(s, bits.real.T).detach().T  # [N_symbols, N_users_c]
-#                 else:
-#                     rm = torch.squeeze(sub(s, bits.real.T).detach(), 1).T
-#
-#                 rm_runs.append(rm)
-#
-#         bits_labels = [
-#             ''.join(str(b) for b in
-#                     int_to_binary(torch.tensor([sym]), N_users_c)[0].int().tolist())
-#             for sym in range(N_symbols)
-#         ]
-#         sym_colors = [sym_cmap(sym / max(N_symbols - 1, 1)) for sym in range(N_symbols)]
-#
-#         def _save(fig, suffix):
-#             if save_path:
-#                 base, ext = os.path.splitext(save_path)
-#                 ext = ext or '.png'
-#                 p = f'{base}_ch{c}_{suffix}{ext}'
-#                 fig.savefig(p, bbox_inches='tight', dpi=150)
-#                 print(f'Saved: {p}')
-#                 plt.close(fig)
-#
-#         # ── Figure 1: TX constellation ────────────────────────────────────────
-#         fig_tx, axes_tx = plt.subplots(1, N_tx_plot,
-#                                        figsize=(6 * N_tx_plot, 6),
-#                                        squeeze=False)
-#         fig_tx.suptitle(f'Channel {c}  |  TX  |  SNR = {snr_db:.1f} dB',
-#                         fontsize=13)
-#
-#         for tx_idx in range(N_tx_plot):
-#             ax = axes_tx[0, tx_idx]
-#             for sym in range(N_symbols):
-#                 ax.scatter(s_plot[sym, tx_idx].real.item(),
-#                            s_plot[sym, tx_idx].imag.item(),
-#                            color=sym_colors[sym], s=100, zorder=3)
-#                 ax.annotate(bits_labels[sym],
-#                             (s_plot[sym, tx_idx].real.item(),
-#                              s_plot[sym, tx_idx].imag.item()),
-#                             textcoords='offset points', xytext=(6, 6),
-#                             fontsize=9, fontweight='bold')
-#             ax.set_title(f'TX antenna {tx_idx}', fontsize=11)
-#             ax.set_xlabel('Real');  ax.set_ylabel('Imag')
-#             ax.grid(True, linestyle='--', alpha=0.4)
-#             ax.axhline(0, color='gray', lw=0.5)
-#             ax.axvline(0, color='gray', lw=0.5)
-#             handles = [mpatches.Patch(color=sym_colors[s], label=bits_labels[s])
-#                        for s in range(N_symbols)]
-#             ax.legend(handles=handles, title='Symbol', fontsize=7,
-#                       ncol=max(1, N_symbols // 4), loc='best')
-#
-#         fig_tx.tight_layout()
-#         _save(fig_tx, 'TX')
-#
-#         # ── One figure per RX user — all symbols on a single plot ──────────
-#         for u in range(N_users_c):
-#             fig_rx, ax = plt.subplots(figsize=(7, 7))
-#             fig_rx.suptitle(
-#                 f'Channel {c}  |  RX user {u}  |  SNR = {snr_db:.1f} dB  '
-#                 f'({n_itr} iteration{"s" if n_itr > 1 else ""})',
-#                 fontsize=13)
-#
-#             for sym in range(N_symbols):
-#                 pts = torch.stack([rm_runs[it][sym, u] for it in range(n_itr)])
-#                 ax.scatter(pts.real.numpy(), pts.imag.numpy(),
-#                            color=sym_colors[sym], s=20, alpha=0.6,
-#                            zorder=3, label=bits_labels[sym])
-#                 # centroid marker
-#                 cx = pts.real.mean().item()
-#                 cy = pts.imag.mean().item()
-#                 ax.scatter([cx], [cy], color=sym_colors[sym], s=80,
-#                            marker='+', zorder=5, linewidths=2)
-#                 ax.annotate(bits_labels[sym], (cx, cy),
-#                             textcoords='offset points', xytext=(6, 6),
-#                             fontsize=9, fontweight='bold',
-#                             color=sym_colors[sym])
-#
-#             ax.set_xlabel('Real', fontsize=10)
-#             ax.set_ylabel('Imag', fontsize=10)
-#             ax.grid(True, linestyle='--', alpha=0.4)
-#             ax.axhline(0, color='gray', lw=0.5)
-#             ax.axvline(0, color='gray', lw=0.5)
-#             handles = [mpatches.Patch(color=sym_colors[s], label=bits_labels[s])
-#                        for s in range(N_symbols)]
-#             ax.legend(handles=handles, title='Symbol', fontsize=8,
-#                       ncol=max(1, N_symbols // 4), loc='best')
-#
-#             fig_rx.tight_layout()
-#             _save(fig_rx, f'RX_user{u}')
-#     if show:
-#         plt.show()
-#
-#
-#
-#
-# # GUI
-# # ─────────────────────────────────────────────────────────────────────────────
-#
-# class App(tk.Tk):
-#     def __init__(self):
-#         super().__init__()
-#         self.title('Model Comparison Tool')
-#         self.resizable(True, True)
-#         self._ber_rows: list[dict] = []
-#         self._log_rows: list[dict] = []
-#         self._build_ui()
-#
-#     # ── top-level notebook ────────────────────────────────────────────────────
-#
-#     def _build_ui(self):
-#         nb = ttk.Notebook(self)
-#         nb.pack(fill='both', expand=True, padx=6, pady=6)
-#
-#         self._tab_ber  = tk.Frame(nb)
-#         self._tab_log  = tk.Frame(nb)
-#         self._tab_var  = tk.Frame(nb)
-#         self._tab_arch = tk.Frame(nb)
-#         nb.add(self._tab_ber,  text='  BER Comparison  ')
-#         nb.add(self._tab_log,  text='  Log Comparison  ')
-#         nb.add(self._tab_var,  text='  Variation Comparison  ')
-#         nb.add(self._tab_arch, text='  Architecture & Constellation  ')
-#
-#         self._build_ber_tab(self._tab_ber)
-#         self._build_log_tab(self._tab_log)
-#         self._build_var_tab(self._tab_var)
-#         self._build_arch_tab(self._tab_arch)
-#
-#     # ══════════════════════════════════════════════════════════════════════════
-#     # TAB 1 — BER
-#     # ══════════════════════════════════════════════════════════════════════════
-#
-#     def _build_ber_tab(self, parent):
-#         pad = dict(padx=8, pady=4)
-#
-#         lf_models = tk.LabelFrame(parent, text='Models', **pad)
-#         lf_models.grid(row=0, column=0, columnspan=2, sticky='nsew', **pad)
-#         self._ber_inner = tk.Frame(lf_models)
-#         self._ber_inner.pack(fill='both', expand=True)
-#         tk.Button(lf_models, text='＋  Add model folder',
-#                   command=self._ber_add).pack(anchor='w', **pad)
-#
-#         lf_eval = tk.LabelFrame(parent, text='Evaluation settings', **pad)
-#         lf_eval.grid(row=1, column=0, sticky='nsew', **pad)
-#
-#         def _erow(label, default, r):
-#             tk.Label(lf_eval, text=label, anchor='w').grid(row=r, column=0, sticky='w', **pad)
-#             v = tk.StringVar(value=default)
-#             tk.Entry(lf_eval, textvariable=v, width=10).grid(row=r, column=1, **pad)
-#             return v
-#
-#         self._snr_min  = _erow('SNR min (dB)',   '-20',  0)
-#         self._snr_max  = _erow('SNR max (dB)',   '40',   1)
-#         self._snr_step = _erow('SNR step (dB)',  '1',    2)
-#         self._batch    = _erow('Batch size',     '1000', 3)
-#         self._n_itr    = _erow('Avg iterations', '10',   4)
-#
-#         lf_out = tk.LabelFrame(parent, text='Output', **pad)
-#         lf_out.grid(row=1, column=1, sticky='nsew', **pad)
-#         tk.Label(lf_out, text='Save plot to (optional)', anchor='w').grid(
-#             row=0, column=0, sticky='w', **pad)
-#         self._ber_save = tk.StringVar()
-#         tk.Entry(lf_out, textvariable=self._ber_save, width=30).grid(row=0, column=1, **pad)
-#         tk.Button(lf_out, text='Browse…',
-#                   command=lambda: self._browse_save(self._ber_save)).grid(row=0, column=2, **pad)
-#         self._ber_show = tk.BooleanVar(value=True)
-#         tk.Checkbutton(lf_out, text='Show plot interactively',
-#                        variable=self._ber_show).grid(row=1, column=0, columnspan=3, sticky='w', **pad)
-#
-#         tk.Button(parent, text='▶  Run BER comparison', font=('', 11, 'bold'),
-#                   bg='#2E86AB', fg='white',
-#                   command=self._ber_run).grid(row=2, column=0, columnspan=2,
-#                                               sticky='ew', padx=8, pady=8)
-#         parent.columnconfigure(0, weight=1)
-#         parent.columnconfigure(1, weight=1)
-#
-#     def _ber_add(self, path=''):
-#         if not path:
-#             path = filedialog.askdirectory(title='Select model folder')
-#         if not path:
-#             return
-#         frame = tk.Frame(self._ber_inner, relief='groove', bd=1, padx=4, pady=4)
-#         frame.pack(fill='x', pady=2)
-#         display = path if len(path) <= 55 else '…' + path[-52:]
-#         tk.Label(frame, text=display, anchor='w', width=52).grid(row=0, column=0, sticky='w')
-#
-#         # one checkbox per stage — multiple can be ticked simultaneously
-#         tk.Label(frame, text='Stages:').grid(row=0, column=1, padx=(8, 2))
-#         stage_vars = {}
-#         for col, s in enumerate((1, 2, 3), start=2):
-#             var = tk.BooleanVar(value=(s == 3))   # stage 3 ticked by default
-#             tk.Checkbutton(frame, text=str(s), variable=var).grid(row=0, column=col, padx=2)
-#             stage_vars[s] = var
-#
-#         tk.Label(frame, text='Label:').grid(row=0, column=5, padx=(8, 2))
-#         label_var = tk.StringVar(value=os.path.basename(path.rstrip('/\\')))
-#         tk.Entry(frame, textvariable=label_var, width=28).grid(row=0, column=6, padx=2)
-#
-#         def _remove(f=frame):
-#             f.destroy()
-#             self._ber_rows = [r for r in self._ber_rows if r['frame'] is not f]
-#
-#         tk.Button(frame, text='✕', fg='red', command=_remove).grid(row=0, column=7, padx=(8, 0))
-#         self._ber_rows.append(dict(path=path, stage_vars=stage_vars,
-#                                    label_var=label_var, frame=frame))
-#         # auto-set SNR min from this model if it's the first one added
-#         if len(self._ber_rows) == 1:
-#             max_snr = read_max_snr_stage1(path)
-#             if max_snr is not None:
-#                 self._snr_min.set(str(int(round(max_snr - 10))))
-#
-#     def _ber_run(self):
-#         rows = [r for r in self._ber_rows if r['frame'].winfo_exists()]
-#         if not rows:
-#             messagebox.showwarning('No models', 'Add at least one model folder.')
-#             return
-#         try:
-#             snr_min  = float(self._snr_min.get())
-#             snr_max  = float(self._snr_max.get())
-#             snr_step = float(self._snr_step.get())
-#             batch    = int(self._batch.get())
-#             num_itr  = int(self._n_itr.get())
-#             snr_range = torch.arange(snr_min, snr_max + snr_step * 0.5, snr_step)
-#         except ValueError as e:
-#             messagebox.showerror('Invalid setting', str(e)); return
-#
-#         save_path = self._ber_save.get().strip() or None
-#         results   = []
-#         for row in rows:
-#             path  = row['path']
-#             name  = row['label_var'].get().strip() or os.path.basename(path.rstrip('/\\'))
-#             selected_stages = [s for s, var in row['stage_vars'].items() if var.get()]
-#             if not selected_stages:
-#                 messagebox.showwarning('No stage selected',
-#                                        f'Select at least one stage for:\n{name}')
-#                 continue
-#             for stage in selected_stages:
-#                 print(f'\n{"="*55}\n  Loading: {name}  |  stage {stage}\n{"="*55}')
-#                 try:
-#                     model = load_model(path, stage)
-#                 except Exception as e:
-#                     messagebox.showerror('Load error',
-#                                          f'Failed to load stage {stage}:\n{path}\n\n{e}')
-#                     continue
-#                 ber = evaluate_model(model, snr_range, batch, num_itr)
-#                 results.append(dict(name=name, stage=stage, ber=ber))
-#                 if save_path:
-#                     base = os.path.splitext(save_path)[0]
-#                     safe = name.replace(' ', '_').replace('\\', '_').replace('/', '_')
-#                     torch.save(ber, f'{base}_{safe}_stage{stage}_BER.pt')
-#         if not results:
-#             messagebox.showinfo('Done', 'No models evaluated.'); return
-#         plot_ber_comparison(results, snr_range,
-#                             save_path=save_path, show=self._ber_show.get())
-#
-#     def _build_log_tab(self, parent):
-#         pad = dict(padx=8, pady=4)
-#
-#         # ── top: log file list ────────────────────────────────────────────────
-#         lf_logs = tk.LabelFrame(parent, text='Log files', **pad)
-#         lf_logs.grid(row=0, column=0, columnspan=3, sticky='nsew', **pad)
-#
-#         self._log_inner = tk.Frame(lf_logs)
-#         self._log_inner.pack(fill='both', expand=True)
-#
-#         btn_row = tk.Frame(lf_logs)
-#         btn_row.pack(fill='x', pady=(4, 0))
-#         tk.Button(btn_row, text='＋  Add log file (.pt)',
-#                   command=self._log_add_file).pack(side='left', **pad)
-#         tk.Button(btn_row, text='＋  Add model folder  (auto-finds log)',
-#                   command=self._log_add_folder).pack(side='left', **pad)
-#
-#         # ── middle: metric selectors ──────────────────────────────────────────
-#         lf_metric = tk.LabelFrame(parent, text='Metrics to plot', **pad)
-#         lf_metric.grid(row=1, column=0, sticky='nsew', **pad)
-#
-#         # Left axis (always shown)
-#         tk.Label(lf_metric, text='Left axis (Y1):', anchor='w',
-#                  font=('', 9, 'bold')).grid(row=0, column=0, sticky='w', **pad)
-#         self._metric_var = tk.StringVar()
-#         self._metric_cb  = ttk.Combobox(lf_metric, textvariable=self._metric_var,
-#                                          state='readonly', width=36)
-#         self._metric_cb.grid(row=0, column=1, sticky='w', **pad)
-#
-#         # Right axis (only active when one log is loaded)
-#         self._metric2_label = tk.Label(lf_metric, text='Right axis (Y2):', anchor='w',
-#                                         font=('', 9, 'bold'))
-#         self._metric2_label.grid(row=1, column=0, sticky='w', **pad)
-#         self._metric2_var = tk.StringVar()
-#         self._metric2_cb  = ttk.Combobox(lf_metric, textvariable=self._metric2_var,
-#                                           state='readonly', width=36)
-#         self._metric2_cb.grid(row=1, column=1, sticky='w', **pad)
-#         self._metric2_none_lbl = tk.Label(lf_metric,
-#                                            text='(available when only one log is loaded)',
-#                                            fg='gray', font=('', 8, 'italic'))
-#         self._metric2_none_lbl.grid(row=1, column=2, sticky='w', padx=4)
-#
-#         tk.Button(lf_metric, text='↺  Refresh',
-#                   command=self._log_refresh_metrics).grid(row=0, column=2, **pad)
-#
-#         # Moving-average window
-#         tk.Label(lf_metric, text='MA window:').grid(row=2, column=0, sticky='w', **pad)
-#         self._ma_var = tk.StringVar(value='10')
-#         tk.Entry(lf_metric, textvariable=self._ma_var, width=6).grid(row=2, column=1,
-#                                                                        sticky='w', **pad)
-#
-#         # ── right: output ─────────────────────────────────────────────────────
-#         lf_out = tk.LabelFrame(parent, text='Output', **pad)
-#         lf_out.grid(row=1, column=1, sticky='nsew', **pad)
-#         tk.Label(lf_out, text='Save plot to (optional)', anchor='w').grid(
-#             row=0, column=0, sticky='w', **pad)
-#         self._log_save = tk.StringVar()
-#         tk.Entry(lf_out, textvariable=self._log_save, width=28).grid(row=0, column=1, **pad)
-#         tk.Button(lf_out, text='Browse…',
-#                   command=lambda: self._browse_save(self._log_save)).grid(row=0, column=2, **pad)
-#         self._log_show = tk.BooleanVar(value=True)
-#         tk.Checkbutton(lf_out, text='Show plot interactively',
-#                        variable=self._log_show).grid(row=1, column=0,
-#                                                      columnspan=3, sticky='w', **pad)
-#
-#         # ── run button ────────────────────────────────────────────────────────
-#         tk.Button(parent, text='▶  Plot logs', font=('', 11, 'bold'),
-#                   bg='#3D8A40', fg='white',
-#                   command=self._log_run).grid(row=2, column=0, columnspan=3,
-#                                               sticky='ew', padx=8, pady=8)
-#
-#         parent.columnconfigure(0, weight=1)
-#         parent.columnconfigure(1, weight=1)
-#
-#     # ── log row management ────────────────────────────────────────────────────
-#
-#     def _log_add_file(self, filepath='', label_default=''):
-#         """Add a row for a .pt log file."""
-#         if not filepath:
-#             filepath = filedialog.askopenfilename(
-#                 title='Select log .pt file',
-#                 filetypes=[('PyTorch files', '*.pt'), ('All files', '*.*')])
-#         if not filepath:
-#             return
-#         try:
-#             test = torch.load(filepath, weights_only=False)
-#             if 'log' in test:
-#                 test = test['log']
-#             assert 'itr_axis' in test, 'No itr_axis key — not a valid log file'
-#         except Exception as e:
-#             messagebox.showerror('Invalid log file', str(e)); return
-#
-#         frame = tk.Frame(self._log_inner, relief='groove', bd=1, padx=4, pady=4)
-#         frame.pack(fill='x', pady=2)
-#
-#         display = filepath if len(filepath) <= 60 else '…' + filepath[-57:]
-#         tk.Label(frame, text=display, anchor='w', width=62,
-#                  font=('', 8)).grid(row=0, column=0, sticky='w')
-#         tk.Label(frame, text='Label:').grid(row=0, column=1, padx=(8, 2))
-#         default_label = label_default or os.path.basename(
-#             os.path.dirname(filepath)).replace('_', ' ')
-#         label_var = tk.StringVar(value=default_label)
-#         tk.Entry(frame, textvariable=label_var, width=22).grid(row=0, column=2, padx=2)
-#
-#         self._log_rows.append(dict(filepath=filepath, label_var=label_var, frame=frame))
-#
-#         def _remove(f=frame):
-#             f.destroy()
-#             self._log_rows = [r for r in self._log_rows if r['frame'] is not f]
-#             self._log_refresh_metrics()
-#
-#         tk.Button(frame, text='✕', fg='red',
-#                   command=_remove).grid(row=0, column=3, padx=(8, 0))
-#
-#         self._log_refresh_metrics()
-#
-#     def _log_add_folder(self):
-#         """Auto-find stage2_all_epochs_raw.pt inside a model folder."""
-#         folder = filedialog.askdirectory(title='Select model folder')
-#         if not folder:
-#             return
-#         candidates = [
-#             os.path.join(folder, 'data', 'stage2_all_epochs_raw.pt'),
-#             os.path.join(folder, 'stage2_all_epochs_raw.pt'),
-#         ]
-#         found = next((p for p in candidates if os.path.exists(p)), None)
-#         if found is None:
-#             found = filedialog.askopenfilename(
-#                 initialdir=os.path.join(folder, 'data'),
-#                 title=f'Cannot auto-find log in {folder} — select manually',
-#                 filetypes=[('PyTorch files', '*.pt'), ('All files', '*.*')])
-#         if found:
-#             self._log_add_file(filepath=found,
-#                                label_default=os.path.basename(folder.rstrip('/\\')))
-#
-#     def _log_refresh_metrics(self):
-#         """Refresh both metric dropdowns from the first loaded log."""
-#         valid = [r for r in self._log_rows if r['frame'].winfo_exists()]
-#
-#         if not valid:
-#             self._metric_cb['values']  = []
-#             self._metric2_cb['values'] = []
-#             return
-#
-#         try:
-#             log  = load_log(valid[0]['filepath'])
-#             opts = expand_metric_names(log)
-#             self._metric_map = {display: (k, ch) for display, k, ch in opts}
-#             names = list(self._metric_map.keys())
-#
-#             self._metric_cb['values']  = names
-#             self._metric2_cb['values'] = ['(none)'] + names
-#
-#             if self._metric_var.get() not in self._metric_map:
-#                 self._metric_cb.current(0)
-#             if self._metric2_var.get() not in self._metric_map:
-#                 self._metric2_cb.current(0)   # sets to '(none)'
-#         except Exception as e:
-#             messagebox.showerror('Metric refresh error', str(e))
-#             return
-#
-#         # Enable / disable second metric depending on number of logs
-#         single = (len(valid) == 1)
-#         state  = 'readonly' if single else 'disabled'
-#         self._metric2_cb.config(state=state)
-#         self._metric2_none_lbl.config(
-#             text='' if single else '(available when only one log is loaded)')
-#
-#     # ── run log plot ──────────────────────────────────────────────────────────
-#
-#     def _log_run(self):
-#         valid = [r for r in self._log_rows if r['frame'].winfo_exists()]
-#         if not valid:
-#             messagebox.showwarning('No logs', 'Add at least one log file.'); return
-#
-#         if not self._metric_var.get():
-#             messagebox.showwarning('No metric', 'Select a metric to plot.'); return
-#
-#         if not hasattr(self, '_metric_map'):
-#             self._log_refresh_metrics()
-#
-#         m1_display = self._metric_var.get()
-#         m2_display = self._metric2_var.get()
-#         if m1_display not in self._metric_map:
-#             messagebox.showerror('Error', f'Unknown metric: {m1_display}'); return
-#
-#         m1_key, m1_ch = self._metric_map[m1_display]
-#         m2_key, m2_ch = None, None
-#         use_twin = (len(valid) == 1
-#                     and m2_display
-#                     and m2_display != '(none)'
-#                     and m2_display in self._metric_map)
-#         if use_twin:
-#             m2_key, m2_ch = self._metric_map[m2_display]
-#
-#         try:
-#             window = int(self._ma_var.get())
-#         except ValueError:
-#             window = 10
-#
-#         # ── load all logs ─────────────────────────────────────────────────────
-#         entries = []
-#         for row in valid:
-#             label = row['label_var'].get().strip()
-#             try:
-#                 log = load_log(row['filepath'])
-#             except Exception as e:
-#                 messagebox.showerror('Load error', f'{label}:\n{e}'); continue
-#             entries.append(dict(label=label, log=log))
-#
-#         if not entries:
-#             return
-#
-#         save_path = self._log_save.get().strip() or None
-#
-#         if use_twin:
-#             # single log, two metrics, twin y-axes
-#             _plot_dual_metric(entries[0], m1_key, m1_ch, m2_key, m2_ch,
-#                               window=window, save_path=save_path,
-#                               show=self._log_show.get())
-#         else:
-#             # multiple logs, one metric
-#             plot_log_comparison(entries, m1_key, m1_ch,
-#                                 window=window, save_path=save_path,
-#                                 show=self._log_show.get())
-#
-#     # ══════════════════════════════════════════════════════════════════════════
-#     # TAB 3 — Variation Comparison
-#     # ══════════════════════════════════════════════════════════════════════════
-#
-#     def _build_var_tab(self, parent):
-#         pad = dict(padx=8, pady=4)
-#
-#         # ── main folder selector ──────────────────────────────────────────────
-#         lf_folder = tk.LabelFrame(parent, text='Main model folder', **pad)
-#         lf_folder.grid(row=0, column=0, columnspan=2, sticky='ew', **pad)
-#         lf_folder.columnconfigure(1, weight=1)
-#
-#         tk.Label(lf_folder, text='Folder:').grid(row=0, column=0, sticky='w', **pad)
-#         self._var_folder_var = tk.StringVar()
-#         self._var_folder_entry = tk.Entry(lf_folder, textvariable=self._var_folder_var,
-#                                           width=60, state='readonly')
-#         self._var_folder_entry.grid(row=0, column=1, sticky='ew', **pad)
-#         tk.Button(lf_folder, text='Browse…',
-#                   command=self._var_browse).grid(row=0, column=2, **pad)
-#         tk.Button(lf_folder, text='⟳  Scan',
-#                   command=self._var_scan).grid(row=0, column=3, **pad)
-#
-#         tk.Label(lf_folder, text='Main model label:').grid(row=1, column=0, sticky='w', **pad)
-#         self._var_main_label = tk.StringVar(value='main model')
-#         tk.Entry(lf_folder, textvariable=self._var_main_label,
-#                  width=40).grid(row=1, column=1, sticky='w', **pad)
-#
-#         # ── sub-folder checklist ──────────────────────────────────────────────
-#         lf_sf = tk.LabelFrame(parent, text='Sub-folders  (select which to include)', **pad)
-#         lf_sf.grid(row=1, column=0, columnspan=2, sticky='nsew', **pad)
-#         lf_sf.columnconfigure(0, weight=1)
-#         lf_sf.rowconfigure(0, weight=1)
-#
-#         sf_canvas = tk.Canvas(lf_sf, height=160, highlightthickness=0)
-#         sf_vsb = tk.Scrollbar(lf_sf, orient='vertical', command=sf_canvas.yview)
-#         sf_canvas.configure(yscrollcommand=sf_vsb.set)
-#         sf_vsb.grid(row=0, column=1, sticky='ns')
-#         sf_canvas.grid(row=0, column=0, sticky='nsew')
-#
-#         self._sf_inner = tk.Frame(sf_canvas)
-#         sf_inner_id = sf_canvas.create_window((0, 0), window=self._sf_inner, anchor='nw')
-#
-#         def _sf_frame_cfg(e):
-#             sf_canvas.configure(scrollregion=sf_canvas.bbox('all'))
-#         self._sf_inner.bind('<Configure>', _sf_frame_cfg)
-#
-#         def _sf_canvas_cfg(e):
-#             sf_canvas.itemconfig(sf_inner_id, width=e.width)
-#         sf_canvas.bind('<Configure>', _sf_canvas_cfg)
-#         self._sf_canvas = sf_canvas
-#         self._sf_entries: list[dict] = []   # {name, enabled_var, frame}
-#
-#         sf_btn_row = tk.Frame(lf_sf)
-#         sf_btn_row.grid(row=1, column=0, columnspan=2, sticky='w', pady=(2, 0))
-#         tk.Button(sf_btn_row, text='Select all',
-#                   command=self._var_sf_select_all).pack(side='left', padx=4)
-#         tk.Button(sf_btn_row, text='Select none',
-#                   command=self._var_sf_select_none).pack(side='left', padx=4)
-#
-#         # ── SNR range ─────────────────────────────────────────────────────────
-#         lf_snr = tk.LabelFrame(parent, text='SNR range  (integer steps of 1)', **pad)
-#         lf_snr.grid(row=2, column=0, sticky='nsew', **pad)
-#
-#         def _srow(label, default, r):
-#             tk.Label(lf_snr, text=label, anchor='w').grid(row=r, column=0, sticky='w', **pad)
-#             v = tk.StringVar(value=default)
-#             tk.Entry(lf_snr, textvariable=v, width=8).grid(row=r, column=1, **pad)
-#             return v
-#
-#         self._var_snr_min  = _srow('SNR min (dB)',  '-20', 0)
-#         self._var_snr_max  = _srow('SNR max (dB)',  '40', 1)
-#         self._var_snr_step = _srow('SNR step (dB)', '1',  2)
-#
-#         # ── output ────────────────────────────────────────────────────────────
-#         lf_out = tk.LabelFrame(parent, text='Output', **pad)
-#         lf_out.grid(row=2, column=1, sticky='nsew', **pad)
-#         tk.Label(lf_out, text='Save plot to (optional)', anchor='w').grid(
-#             row=0, column=0, sticky='w', **pad)
-#         self._var_save = tk.StringVar()
-#         tk.Entry(lf_out, textvariable=self._var_save, width=28).grid(row=0, column=1, **pad)
-#         tk.Button(lf_out, text='Browse…',
-#                   command=lambda: self._browse_save(self._var_save)).grid(row=0, column=2, **pad)
-#         self._var_show = tk.BooleanVar(value=True)
-#         tk.Checkbutton(lf_out, text='Show plot interactively',
-#                        variable=self._var_show).grid(row=1, column=0,
-#                                                      columnspan=3, sticky='w', **pad)
-#
-#         # ── run buttons ───────────────────────────────────────────────────────
-#         btn_frame = tk.Frame(parent)
-#         btn_frame.grid(row=3, column=0, columnspan=2, sticky='ew', padx=8, pady=8)
-#         btn_frame.columnconfigure(0, weight=1)
-#         btn_frame.columnconfigure(1, weight=1)
-#
-#         tk.Button(btn_frame, text='▶  Plot all models', font=('', 11, 'bold'),
-#                   bg='#27AE60', fg='white',
-#                   command=self._var_run_all).grid(row=0, column=0, sticky='ew', padx=(0, 4))
-#         tk.Button(btn_frame, text='▶  Plot BER envelope', font=('', 11, 'bold'),
-#                   bg='#2E86AB', fg='white',
-#                   command=self._var_run_envelope).grid(row=0, column=1, sticky='ew', padx=(4, 0))
-#
-#         parent.columnconfigure(0, weight=1)
-#         parent.columnconfigure(1, weight=1)
-#         parent.rowconfigure(1, weight=1)
-#
-#     # ── variation helpers ─────────────────────────────────────────────────────
-#
-#     def _var_browse(self):
-#         path = filedialog.askdirectory(title='Select main model folder')
-#         if path:
-#             self._var_folder_entry.configure(state='normal')
-#             self._var_folder_var.set(path)
-#             self._var_folder_entry.configure(state='readonly')
-#             self._var_scan()
-#
-#     def _var_scan(self):
-#         """Scan main folder and populate the sub-folder checklist."""
-#         folder = self._var_folder_var.get().strip()
-#         if not folder:
-#             messagebox.showwarning('No folder', 'Please select a main model folder first.')
-#             return
-#         # auto-fill the main model label with the folder name (user can override)
-#         self._var_main_label.set(os.path.basename(folder.rstrip('/\\')))
-#
-#         for w in self._sf_inner.winfo_children():
-#             w.destroy()
-#         self._sf_entries.clear()
-#
-#         # auto-set SNR min from the main model's data folder (always, even if no subfolders)
-#         max_snr = read_max_snr_stage1(folder)
-#         if max_snr is not None:
-#             self._var_snr_min.set(str(int(round(max_snr - 10))))
-#             print(f'  Auto SNR min set to {int(round(max_snr - 10))} dB '
-#                   f'(max_snr_train_stage_1={max_snr:.1f} - 10)')
-#
-#         subfolders = discover_subfolders(folder)
-#         if not subfolders:
-#             tk.Label(self._sf_inner,
-#                      text='No sub-folders with valid models found.\n'
-#                           'Expected: <main>/<sub_folder>/<model>/outputs/{SNR.pt, worst_BER.pt}',
-#                      fg='gray', justify='left').pack(anchor='w', padx=8, pady=8)
-#             self._sf_canvas.configure(scrollregion=self._sf_canvas.bbox('all'))
-#             return
-#
-#         for sf_name in subfolders:
-#             frame = tk.Frame(self._sf_inner, relief='flat', bd=0)
-#             frame.pack(fill='x', pady=1, padx=4)
-#             enabled_var = tk.BooleanVar(value=True)
-#             tk.Checkbutton(frame, variable=enabled_var).grid(row=0, column=0)
-#             display_var = tk.StringVar(value=sf_name)
-#             tk.Entry(frame, textvariable=display_var, width=40,
-#                      font=('', 9)).grid(row=0, column=1, padx=4, sticky='w')
-#             tk.Label(frame, text=sf_name, fg='gray',
-#                      font=('', 7)).grid(row=0, column=2, padx=(2, 8), sticky='w')
-#             self._sf_entries.append({'name': sf_name, 'display_var': display_var,
-#                                      'enabled_var': enabled_var, 'frame': frame})
-#
-#         self._sf_inner.update_idletasks()
-#         self._sf_canvas.configure(scrollregion=self._sf_canvas.bbox('all'))
-#         print(f'Found {len(subfolders)} sub-folder(s).')
-#
-#     def _var_sf_select_all(self):
-#         for e in self._sf_entries:
-#             e['enabled_var'].set(True)
-#
-#     def _var_sf_select_none(self):
-#         for e in self._sf_entries:
-#             e['enabled_var'].set(False)
-#
-#     def _var_get_snr_and_active_sf(self):
-#         """Shared validation: returns (snr_targets, active_sf_names) or (None, None)."""
-#         try:
-#             snr_min  = float(self._var_snr_min.get())
-#             snr_max  = float(self._var_snr_max.get())
-#             snr_step = float(self._var_snr_step.get())
-#         except ValueError as e:
-#             messagebox.showerror('Invalid SNR', str(e))
-#             return None, None
-#
-#         if snr_min >= snr_max:
-#             messagebox.showerror('Invalid SNR', 'SNR min must be less than SNR max.')
-#             return None, None
-#         if snr_step <= 0:
-#             messagebox.showerror('Invalid SNR', 'SNR step must be positive.')
-#             return None, None
-#
-#         active_sf = [(e['name'], e['display_var'].get().strip() or e['name'])
-#                      for e in self._sf_entries
-#                      if e['frame'].winfo_exists() and e['enabled_var'].get()]
-#         if not active_sf:
-#             messagebox.showwarning('Nothing selected', 'Please select at least one sub-folder.')
-#             return None, None
-#
-#         return np.arange(snr_min, snr_max + snr_step * 0.5, snr_step), active_sf
-#
-#     def _var_load_main_ber(self, snr_targets):
-#         """
-#         Load stage-3 and stage-1 worst BER from <main_folder>/outputs/.
-#         Files expected:
-#             SNR.pt
-#             worst_BER_stage_3.pt   — shape [N_snr] or [N_channels, N_snr]
-#             worst_BER_stage_1.pt   — same shape (optional)
-#         Returns a list of dicts (one per stage found), each:
-#             {'label', 'snr': np.ndarray, 'ber': np.ndarray}
-#         Returns empty list if the outputs folder / SNR file is missing.
-#         """
-#         folder = self._var_folder_var.get().strip()
-#         out    = os.path.join(folder, 'outputs')
-#         snr_f  = os.path.join(out, 'SNR.pt')
-#         base_label = self._var_main_label.get().strip() or os.path.basename(folder.rstrip('/\\'))
-#
-#         print(f'  Looking for main model outputs in: {out}')
-#
-#         if not os.path.isfile(snr_f):
-#             messagebox.showinfo('Main model',
-#                                 f'SNR.pt not found at:\n{snr_f}\n\n'
-#                                 'Main model will not be plotted.')
-#             return []
-#
-#         try:
-#             snr_raw = torch.load(snr_f, weights_only=True)
-#             snr_np  = (snr_raw.numpy() if torch.is_tensor(snr_raw)
-#                        else np.array(snr_raw)).flatten()
-#         except Exception as ex:
-#             messagebox.showwarning('Main model SNR load error', str(ex))
-#             return []
-#
-#         def _load_stage_ber(stage):
-#             ber_f = os.path.join(out, f'worst_BER_stage_{stage}.pt')
-#             print(f'    worst_BER_stage_{stage}.pt exists: {os.path.isfile(ber_f)}')
-#             if not os.path.isfile(ber_f):
-#                 return None
-#             try:
-#                 ber_raw = torch.load(ber_f, weights_only=True)
-#                 ber_np  = (ber_raw.numpy() if torch.is_tensor(ber_raw)
-#                            else np.array(ber_raw))
-#                 if ber_np.ndim == 2:
-#                     ber_np = ber_np.max(axis=0)
-#                 ber_np = ber_np.flatten()
-#
-#                 matched_snr, matched_ber = [], []
-#                 for t in snr_targets:
-#                     idx = int(np.argmin(np.abs(snr_np - t)))
-#                     matched_snr.append(snr_np[idx])
-#                     matched_ber.append(ber_np[idx])
-#                 snr_m = np.array(matched_snr)
-#                 ber_m = np.array(matched_ber)
-#                 print(f'  Main stage {stage} loaded. BER range: {ber_m.min():.2e}–{ber_m.max():.2e}')
-#                 return {'label': f'{base_label}  (main stage {stage})',
-#                         'snr': snr_m, 'ber': ber_m}
-#             except Exception as ex:
-#                 print(f'  Warning: could not load stage {stage} BER: {ex}')
-#                 return None
-#
-#         results = []
-#         for stage in (3, 1):
-#             entry = _load_stage_ber(stage)
-#             if entry is not None:
-#                 results.append(entry)
-#
-#         if not results:
-#             messagebox.showinfo('Main model',
-#                                 f'No worst_BER_stage_*.pt files found in:\n{out}\n\n'
-#                                 'Main model will not be plotted.')
-#         return results
-#
-#     def _var_run_all(self):
-#         """Plot every individual model curve."""
-#         snr_targets, active_sf = self._var_get_snr_and_active_sf()
-#         if snr_targets is None:
-#             return
-#
-#         folder   = self._var_folder_var.get().strip()
-#         sf_names = [name for name, _ in active_sf]
-#         sf_labels = {name: lbl for name, lbl in active_sf}
-#         models = discover_models_in_subfolders(folder, sf_names)
-#         if not models:
-#             messagebox.showinfo('No models', 'No valid models found in selected sub-folders.')
-#             return
-#
-#         results, errors = [], []
-#         for m in models:
-#             # replace the sf_name part of the label with the user's display label
-#             sf_part   = m['label'].split(' / ')[0]
-#             model_part = m['label'].split(' / ', 1)[1] if ' / ' in m['label'] else m['label']
-#             display_label = f"{sf_labels.get(sf_part, sf_part)} / {model_part}"
-#             try:
-#                 snr_m, ber_m = load_variation_ber(m['outputs_path'], snr_targets)
-#                 results.append({'label': display_label, 'snr': snr_m, 'ber': ber_m})
-#             except Exception as ex:
-#                 errors.append(f"{display_label}:\n  {ex}")
-#
-#         if errors:
-#             messagebox.showwarning('Load warnings',
-#                                    'Some models could not be loaded:\n\n' + '\n\n'.join(errors))
-#         if not results:
-#             messagebox.showinfo('Done', 'No models loaded successfully.')
-#             return
-#
-#         save_path = self._var_save.get().strip() or None
-#         main_bers = self._var_load_main_ber(snr_targets)
-#         plot_variation_all(results, main_bers=main_bers, save_path=save_path, show=self._var_show.get())
-#
-#     def _var_run_envelope(self):
-#         """For each sub-folder plot the worst/best BER envelope with filled area."""
-#         snr_targets, active_sf = self._var_get_snr_and_active_sf()
-#         if snr_targets is None:
-#             return
-#
-#         folder = self._var_folder_var.get().strip()
-#         folder_results, errors = [], []
-#
-#         for sf_name, sf_display in active_sf:
-#             models = discover_models_in_subfolders(folder, [sf_name])
-#             if not models:
-#                 errors.append(f'{sf_name}: no valid models found')
-#                 continue
-#
-#             ber_rows = []
-#             for m in models:
-#                 try:
-#                     _, ber_m = load_variation_ber(m['outputs_path'], snr_targets)
-#                     ber_rows.append(ber_m)
-#                 except Exception as ex:
-#                     errors.append(f"{m['label']}:\n  {ex}")
-#
-#             if not ber_rows:
-#                 continue
-#
-#             ber_mat = np.vstack(ber_rows)          # [N_models, N_snr]
-#             snr_rep, _ = load_variation_ber(models[0]['outputs_path'], snr_targets)
-#
-#             folder_results.append({
-#                 'label':   sf_display,
-#                 'snr':     snr_rep,
-#                 'ber_mat': ber_mat,
-#             })
-#             print(f'  {sf_display} ({sf_name}): {len(ber_rows)} model(s) loaded')
-#
-#         if errors:
-#             messagebox.showwarning('Load warnings',
-#                                    'Some models could not be loaded:\n\n' + '\n\n'.join(errors))
-#         if not folder_results:
-#             messagebox.showinfo('Done', 'No data to plot.')
-#             return
-#
-#         save_path = self._var_save.get().strip() or None
-#         main_bers = self._var_load_main_ber(snr_targets)
-#         plot_variation_envelope(folder_results, main_bers=main_bers, save_path=save_path, show=self._var_show.get())
-#
-#             # ── shared helpers ────────────────────────────────────────────────────────
-#
-#     def _browse_save(self, var):
-#         p = filedialog.asksaveasfilename(
-#             defaultextension='.png',
-#             filetypes=[('PNG image', '*.png'), ('PDF', '*.pdf'), ('All files', '*.*')],
-#             title='Save plot as…')
-#         if p:
-#             var.set(p)
-#
-#
-#     # ══════════════════════════════════════════════════════════════════════════
-#     # TAB 4 — Architecture & Constellation
-#     # ══════════════════════════════════════════════════════════════════════════
-#
-#     def _build_arch_tab(self, parent):
-#         pad = dict(padx=8, pady=4)
-#
-#         # ── model selector ────────────────────────────────────────────────────
-#         lf_model = tk.LabelFrame(parent, text='Model', **pad)
-#         lf_model.grid(row=0, column=0, columnspan=2, sticky='ew', **pad)
-#         lf_model.columnconfigure(1, weight=1)
-#
-#         tk.Label(lf_model, text='Folder:').grid(row=0, column=0, sticky='w', **pad)
-#         self._arch_folder_var = tk.StringVar()
-#         self._arch_folder_entry = tk.Entry(lf_model, textvariable=self._arch_folder_var,
-#                                            width=60, state='readonly')
-#         self._arch_folder_entry.grid(row=0, column=1, sticky='ew', **pad)
-#         tk.Button(lf_model, text='Browse…',
-#                   command=self._arch_browse).grid(row=0, column=2, **pad)
-#
-#         tk.Label(lf_model, text='Stage:').grid(row=1, column=0, sticky='w', **pad)
-#         self._arch_stage_var = tk.IntVar(value=3)
-#         sf = tk.Frame(lf_model)
-#         sf.grid(row=1, column=1, sticky='w')
-#         for s in (1, 2, 3):
-#             tk.Radiobutton(sf, text=str(s), variable=self._arch_stage_var,
-#                            value=s).pack(side='left', padx=4)
-#
-#         # ── constellation settings ────────────────────────────────────────────
-#         lf_const = tk.LabelFrame(parent, text='Constellation settings', **pad)
-#         lf_const.grid(row=1, column=0, sticky='nsew', **pad)
-#
-#         def _erow(lf, label, default, r):
-#             tk.Label(lf, text=label, anchor='w').grid(row=r, column=0, sticky='w', **pad)
-#             v = tk.StringVar(value=default)
-#             tk.Entry(lf, textvariable=v, width=10).grid(row=r, column=1, **pad)
-#             return v
-#
-#         self._arch_snr    = _erow(lf_const, 'SNR (dB)',              '10', 0)
-#         self._arch_itr    = _erow(lf_const, 'Noise avg iterations', '1',  1)
-#
-#         # ── output ────────────────────────────────────────────────────────────
-#         lf_out = tk.LabelFrame(parent, text='Output', **pad)
-#         lf_out.grid(row=1, column=1, sticky='nsew', **pad)
-#
-#         tk.Label(lf_out, text='Save plot to (optional)', anchor='w').grid(
-#             row=0, column=0, sticky='w', **pad)
-#         self._arch_save = tk.StringVar()
-#         tk.Entry(lf_out, textvariable=self._arch_save, width=28).grid(row=0, column=1, **pad)
-#         tk.Button(lf_out, text='Browse…',
-#                   command=lambda: self._browse_save(self._arch_save)).grid(row=0, column=2, **pad)
-#         self._arch_show = tk.BooleanVar(value=True)
-#         tk.Checkbutton(lf_out, text='Show plot interactively',
-#                        variable=self._arch_show).grid(row=1, column=0,
-#                                                       columnspan=3, sticky='w', **pad)
-#
-#         # ── run buttons ───────────────────────────────────────────────────────
-#         btn_frame = tk.Frame(parent)
-#         btn_frame.grid(row=2, column=0, columnspan=2, sticky='ew', padx=8, pady=8)
-#         btn_frame.columnconfigure(0, weight=1)
-#         btn_frame.columnconfigure(1, weight=1)
-#
-#         tk.Button(btn_frame, text='▶  Plot Architecture', font=('', 11, 'bold'),
-#                   bg='#8E44AD', fg='white',
-#                   command=self._arch_run_topology).grid(row=0, column=0, sticky='ew', padx=(0, 4))
-#         tk.Button(btn_frame, text='▶  Plot Constellation', font=('', 11, 'bold'),
-#                   bg='#E67E22', fg='white',
-#                   command=self._arch_run_constellation).grid(row=0, column=1, sticky='ew', padx=(4, 0))
-#
-#         parent.columnconfigure(0, weight=1)
-#         parent.columnconfigure(1, weight=1)
-#
-#     # ── arch helpers ──────────────────────────────────────────────────────────
-#
-#     def _arch_browse(self):
-#         path = filedialog.askdirectory(title='Select model folder')
-#         if path:
-#             self._arch_folder_entry.configure(state='normal')
-#             self._arch_folder_var.set(path)
-#             self._arch_folder_entry.configure(state='readonly')
-#
-#     def _arch_load(self):
-#         path = self._arch_folder_var.get().strip()
-#         if not path:
-#             messagebox.showwarning('No folder', 'Please select a model folder.')
-#             return None
-#         stage = self._arch_stage_var.get()
-#         try:
-#             model = load_model(path, stage)
-#             return model
-#         except Exception as e:
-#             messagebox.showerror('Load error', f'Failed to load model:\n{e}')
-#             return None
-#
-#     def _arch_run_topology(self):
-#         model = self._arch_load()
-#         if model is None:
-#             return
-#         folder = self._arch_folder_var.get().strip()
-#         save_path = self._arch_save.get().strip() or None
-#         plot_architecture(model, folder_path=folder, save_path=save_path, show=self._arch_show.get())
-#
-#     def _arch_run_constellation(self):
-#         model = self._arch_load()
-#         if model is None:
-#             return
-#         try:
-#             snr_db = float(self._arch_snr.get())
-#             n_itr  = int(self._arch_itr.get())
-#         except ValueError as e:
-#             messagebox.showerror('Invalid setting', str(e))
-#             return
-#         save_path = self._arch_save.get().strip() or None
-#         plot_constellation(model, snr_db=snr_db, n_itr=n_itr,
-#                            save_path=save_path, show=self._arch_show.get())
-#
-#
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Entry point
-# # ─────────────────────────────────────────────────────────────────────────────
-#
-# if __name__ == '__main__':
-#     app = App()
-#     app.mainloop()
-
 """
-compare_models.py
-=================
-Two-tab GUI tool for offline model analysis.
+compare_models.py  —  CLI version
+==================================
+All analysis runs from the command line.  No GUI required.
 
-Tab 1 – BER Comparison
-    Load trained model folders, evaluate BER vs SNR, overlay results.
+Sub-commands
+------------
+  ber          Evaluate BER vs SNR for one or more model/stage pairs
+  log          Plot training log metrics
+  variation    Plot BER envelope or all-model curves across variation sub-folders
+  arch         Plot network spatial architecture
+  const        Plot TX/RX constellation diagrams
 
-Tab 2 – Log Comparison
-    Load stage-2 log .pt files (stage2_all_epochs_raw.pt) from one or more
-    models and overlay any logged metric on a single graph.
-    Special case: when only ONE model is loaded, two log files from that
-    model can be selected and plotted together (e.g. two training runs).
+Run  python compare_models.py <subcommand> --help  for full options.
+
+Examples
+--------
+  python compare_models.py ber \\
+      --model path/to/model1 --stage 3 --label "Model A" \\
+      --model path/to/model2 --stage 1 --label "Model B" \\
+      --snr-min 20 --snr-max 40 --snr-step 1 \\
+      --save results/ber.png
+
+  python compare_models.py variation \\
+      --main path/to/main_model \\
+      --subfolders close_sel_dist3 close_sel_dist5 \\
+      --snr-min 20 --snr-max 40 \\
+      --mode envelope --save results/envelope.png
+
+  python compare_models.py arch \\
+      --model path/to/model --stage 3
+
+  python compare_models.py const \\
+      --model path/to/model --stage 3 \\
+      --snr 10 --itr 50 --save results/const.png
 """
 
 import os
 import sys
-import tkinter as tk          # kept only for BooleanVar / StringVar / IntVar
-from tkinter import filedialog, messagebox
-import customtkinter as ctk
-
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
+import argparse
 
 import matplotlib
-matplotlib.use("TkAgg")
+matplotlib.use("Agg")          # headless — no display needed
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.patches as mpatches
 import numpy as np
 import torch
 
@@ -1757,47 +59,26 @@ from Network_multy_channels import Network_multy_channel  # noqa: E402
 MARKERS = ['o', '^', 'D', 's', 'P', '*', 'X', 'v', '<', '>']
 COLORS  = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
-# All keys present in the log dict that can be plotted.
-# (channel-indexed ones are expanded dynamically after loading)
 LOG_SCALAR_KEYS = ['loss', 'v_score', 'n_drops', 'worst_BER']
 LOG_PER_CH_KEYS = ['BER_per_ch', 'n_relays_per_ch',
                    'w_norm_per_ch', 'b_norm_per_ch', 'p_entropy_per_ch']
 
 METRIC_LABELS = {
-    'loss':           'Total loss',
-    'v_score':        'V score',
-    'n_drops':        'Weight drops / 100 itr',
-    'worst_BER':      'Worst BER (all channels)',
-    'BER_per_ch':     'Worst BER',
-    'n_relays_per_ch':'Active relays (P>0.9)',
-    'w_norm_per_ch':  'Mean |w|',
-    'b_norm_per_ch':  'Mean |b|',
+    'loss':            'Total loss',
+    'v_score':         'V score',
+    'n_drops':         'Weight drops / 100 itr',
+    'worst_BER':       'Worst BER (all channels)',
+    'BER_per_ch':      'Worst BER',
+    'n_relays_per_ch': 'Active relays (P>0.9)',
+    'w_norm_per_ch':   'Mean |w|',
+    'b_norm_per_ch':   'Mean |b|',
     'p_entropy_per_ch':'P entropy (nats)',
 }
 
 USE_LOG_SCALE = {'worst_BER', 'BER_per_ch'}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared utility
-# ─────────────────────────────────────────────────────────────────────────────
-
-def read_max_snr_stage1(model_folder: str) -> float | None:
-    """
-    Read max_snr_train_stage_1.pt from <model_folder>/data/.
-    Returns the float value, or None if the file doesn't exist.
-    """
-    path = os.path.join(model_folder, 'data', 'max_snr_train_stage_1.pt')
-    if not os.path.isfile(path):
-        return None
-    try:
-        val = torch.load(path, weights_only=True)
-        return float(val)
-    except Exception:
-        return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BER helpers  (unchanged from original)
+# Shared utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
 def dB2lin(x):
@@ -1806,38 +87,56 @@ def dB2lin(x):
     return torch.pow(10.0, x / 10.0)
 
 
+def read_max_snr_stage1(model_folder):
+    path = os.path.join(model_folder, 'data', 'max_snr_train_stage_1.pt')
+    if not os.path.isfile(path):
+        return None
+    try:
+        return float(torch.load(path, weights_only=True))
+    except Exception:
+        return None
+
+
 def load_model(path, stage):
     def _pt(name):
         return torch.load(os.path.join(path, 'data', name + '.pt'), weights_only=True)
-    MatcgRR           = _pt('MatcgRR')
-    MatcgSR           = _pt('MatcgSR')
-    cgRU              = _pt('cgRU')
-    connectaionMatrix = _pt('connectaionMatrix')
-    N_users           = _pt('N_users')
-    N_channels        = int(_pt('N_channels'))
-    N_relays          = int(_pt('N_relays'))
-    demod_type        = _pt('demod_type')
-    N_rx             = _pt('N_rx')
-    N_tx            = _pt('N_tx')
-    cgTU             = _pt('cgTU')
-    modCode_order     = [2 ** int(n) for n in N_users]
-    model = Network_multy_channel(N_users=N_users,
-                                  N_relays=N_relays,
-                                  N_channels=N_channels,
-                                  connectaionMatrix=connectaionMatrix,
-                                  MatcgSR=MatcgSR,
-                                  MatcgRR=MatcgRR,
-                                  MatcgRU=cgRU,
-                                  MatcgTU=cgTU,
-                                  modCode_order=modCode_order,
-                                  demod_type=demod_type,
-                                  N_rx=N_rx,
-                                  N_tx=N_tx
-                                  )
-    model.load(path + '\\', f'stage_{stage}')
+    model = Network_multy_channel(
+        N_users           = _pt('N_users'),
+        N_relays          = int(_pt('N_relays')),
+        N_channels        = int(_pt('N_channels')),
+        connectaionMatrix = _pt('connectaionMatrix'),
+        MatcgSR           = _pt('MatcgSR'),
+        MatcgRR           = _pt('MatcgRR'),
+        MatcgRU           = _pt('cgRU'),
+        MatcgTU           = _pt('cgTU'),
+        modCode_order     = [2 ** int(n) for n in _pt('N_users')],
+        demod_type        = _pt('demod_type'),
+        N_rx              = _pt('N_rx'),
+        N_tx              = _pt('N_tx'),
+    )
+    model.load(os.path.join(path, ''), f'stage_{stage}')
     model.eval()
     return model
 
+
+def savefig(fig, path, dpi=150):
+    if path:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        fig.savefig(path, bbox_inches='tight', dpi=dpi)
+        print(f'Saved: {path}')
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+def int_to_binary(integers, n_bits):
+    mask = 2 ** torch.arange(n_bits - 1, -1, -1)
+    return ((integers.unsqueeze(-1) & mask) > 0).int()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BER
+# ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_model(model, snr_range, batch, num_itr):
     C   = model.N_channels
@@ -1849,248 +148,203 @@ def evaluate_model(model, snr_range, batch, num_itr):
                 model.sub_networks[c].SNR = snr_lin
                 acc = 0.0
                 for _ in range(num_itr):
-                    signal,bits = model.sub_networks[c].modulator(batch)
-                    rm   = model.sub_networks[c](signal,bits)
+                    signal, bits = model.sub_networks[c].modulator(batch)
+                    rm   = model.sub_networks[c](signal, bits)
                     pred = model.sub_networks[c].demodulator(rm)
                     worst, _, _ = model.sub_networks[c].BER(bits=bits, pred=pred)
                     acc += float(worst)
                 out[c, si] = acc / num_itr
-                print(f'  ch{c} SNR={snr:.1f} dB  BER={out[c,si]:.3e}')
+                print(f'  ch{c} SNR={float(snr):.1f} dB  BER={out[c,si]:.3e}')
                 if out[c, si] == 0:
                     break
     return out
 
 
-def plot_ber_comparison(results, snr_range, save_path=None, show=True):
+def plot_ber_comparison(results, snr_range, save_path=None):
     fig, ax = plt.subplots(figsize=(11, 6))
     ax.set_title('BER vs SNR — model comparison', fontsize=14)
     ax.set_xlabel('SNR (dB)', fontsize=12)
     ax.set_ylabel('BER (log scale)', fontsize=12)
     ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
-    snr_np    = snr_range.numpy()
-    color_idx = 0
-    for entry in results:
+    snr_np = snr_range.numpy()
+    for i, entry in enumerate(results):
         name  = entry['name']
         stage = entry['stage']
         ber   = entry['ber']
         C     = ber.shape[0]
-        color  = COLORS[color_idx % len(COLORS)]
-        marker = MARKERS[color_idx % len(MARKERS)]
-        color_idx += 1
+        color  = COLORS[i % len(COLORS)]
+        marker = MARKERS[i % len(MARKERS)]
         if C == 1:
-            ax.semilogy(snr_np, ber[0].numpy(), marker=marker,
-                        color=color, linewidth=1.8, markersize=5,
+            ax.semilogy(snr_np, ber[0].numpy(), marker=marker, color=color,
+                        linewidth=1.8, markersize=5,
                         label=f'{name}  (stage {stage})')
         else:
-            worst_overall = ber.max(dim=0).values.numpy()
-            ax.semilogy(snr_np, worst_overall, marker=marker,
-                        color=color, linewidth=2, markersize=5,
+            worst = ber.max(dim=0).values.numpy()
+            ax.semilogy(snr_np, worst, marker=marker, color=color,
+                        linewidth=2, markersize=5,
                         label=f'{name}  (stage {stage}, worst ch)')
             for c in range(C):
                 ax.semilogy(snr_np, ber[c].numpy(), linestyle='--',
                             color=color, linewidth=0.9, alpha=0.55,
                             label=f'{name}  (stage {stage}, ch{c})')
-    ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1),
-              borderaxespad=0, fontsize=9)
+    ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), borderaxespad=0, fontsize=9)
     fig.tight_layout(rect=[0, 0, 0.78, 1])
-    if save_path:
-        fig.savefig(save_path, bbox_inches='tight', dpi=150)
-        print(f'Plot saved to {save_path}')
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+    savefig(fig, save_path)
+
+
+def cmd_ber(args):
+    if not args.model:
+        print('ERROR: at least one --model path required'); return
+
+    snr_min = args.snr_min
+    if snr_min is None:
+        snr_min = read_max_snr_stage1(args.model[0])
+        if snr_min is not None:
+            snr_min -= 10
+            print(f'Auto SNR min: {snr_min:.1f} dB')
+        else:
+            snr_min = -20.0
+
+    snr_range = torch.arange(snr_min, args.snr_max + args.snr_step * 0.5, args.snr_step)
+    results   = []
+
+    for i, path in enumerate(args.model):
+        stages = args.stage if args.stage else [3]
+        label  = args.label[i] if args.label and i < len(args.label) \
+                 else os.path.basename(os.path.normpath(path))
+        for stage in stages:
+            print(f'\nLoading: {label}  |  stage {stage}')
+            try:
+                model = load_model(path, stage)
+            except Exception as e:
+                print(f'ERROR loading model: {e}'); continue
+            ber = evaluate_model(model, snr_range, args.batch, args.itr)
+            results.append(dict(name=label, stage=stage, ber=ber))
+            if args.save:
+                base = os.path.splitext(args.save)[0]
+                safe = label.replace(' ', '_')
+                # torch.save(ber, f'{base}_{safe}_stage{stage}_BER.pt')
+
+    if results:
+        plot_ber_comparison(results, snr_range, save_path=args.save)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Log helpers
+# Log
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_log(filepath):
-    """Load a stage2_all_epochs_raw.pt log dict."""
     data = torch.load(filepath, weights_only=False)
-    # unwrap if saved inside a wrapper dict (stage2_epochXX_raw.pt format)
     if 'log' in data and isinstance(data['log'], dict):
         data = data['log']
     return data
 
 
-def expand_metric_names(log):
-    """
-    Return a list of (display_name, key, channel_or_None) tuples
-    for every plottable series in the log.
-    """
-    names = []
-    for k in LOG_SCALAR_KEYS:
-        if k in log:
-            names.append((METRIC_LABELS.get(k, k), k, None))
-    for k in LOG_PER_CH_KEYS:
-        if k in log:
-            ch_dict = log[k]
-            for c in sorted(ch_dict.keys()):
-                display = f'{METRIC_LABELS.get(k, k)} — ch {c}'
-                names.append((display, k, c))
-    return names
-
-
 def get_series(log, key, channel):
-    """Extract (itr_array, values_array) from a log dict."""
-    itr = np.array(log['itr_axis'])
-    if channel is None:
-        vals = np.array(log[key], dtype=float)
-    else:
-        vals = np.array(log[key][channel], dtype=float)
+    itr  = np.array(log['itr_axis'])
+    vals = np.array(log[key] if channel is None else log[key][channel], dtype=float)
     return itr, vals
 
 
 def plot_log_comparison(entries, metric_key, metric_channel,
-                        window=10, save_path=None, show=True):
-    """
-    entries : list of {label, log}
-    metric_key / metric_channel : which series to plot
-    """
-    use_log  = metric_key in USE_LOG_SCALE
-    ma_kern  = np.ones(window) / window
-    fig, ax  = plt.subplots(figsize=(12, 5))
-    title    = METRIC_LABELS.get(metric_key, metric_key)
+                        window=10, save_path=None):
+    use_log = metric_key in USE_LOG_SCALE
+    ma_kern = np.ones(window) / window
+    fig, ax = plt.subplots(figsize=(12, 5))
+    title = METRIC_LABELS.get(metric_key, metric_key)
     if metric_channel is not None:
         title += f' — ch {metric_channel}'
     ax.set_title(title, fontsize=13)
     ax.set_xlabel('Iteration')
     ax.set_ylabel(title)
     ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.6)
-
     plot_fn = ax.semilogy if use_log else ax.plot
-    color_idx = 0
 
-    for entry in entries:
-        label = entry['label']
-        log   = entry['log']
-        color  = COLORS[color_idx % len(COLORS)]
-        marker = MARKERS[color_idx % len(MARKERS)]
-        color_idx += 1
-
-        itr, vals = get_series(log, metric_key, metric_channel)
-        # mask zeros for log-scale plots
+    for i, entry in enumerate(entries):
+        color  = COLORS[i % len(COLORS)]
+        marker = MARKERS[i % len(MARKERS)]
+        itr, vals = get_series(entry['log'], metric_key, metric_channel)
         if use_log:
             vals = np.where(vals == 0, np.nan, vals)
-
         plot_fn(itr, vals, color=color, alpha=0.3, linewidth=1)
         valid = ~np.isnan(vals)
         if valid.sum() >= window:
             ma = np.convolve(vals[valid], ma_kern, mode='valid')
-            plot_fn(itr[valid][window - 1:], ma,
-                    color=color, linewidth=2,
-                    marker=marker, markevery=max(1, len(ma)//15),
-                    markersize=5, label=label)
+            plot_fn(itr[valid][window - 1:], ma, color=color, linewidth=2,
+                    marker=marker, markevery=max(1, len(ma) // 15),
+                    markersize=5, label=entry['label'])
         else:
             plot_fn(itr[valid], vals[valid], color=color,
-                    linewidth=2, marker=marker, markersize=5, label=label)
+                    linewidth=2, marker=marker, markersize=5, label=entry['label'])
 
-    ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1),
-              borderaxespad=0, fontsize=9)
+    ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), borderaxespad=0, fontsize=9)
     fig.tight_layout(rect=[0, 0, 0.80, 1])
-    if save_path:
-        fig.savefig(save_path, bbox_inches='tight', dpi=150)
-        print(f'Log plot saved to {save_path}')
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+    savefig(fig, save_path)
 
 
-def _plot_dual_metric(entry, m1_key, m1_ch, m2_key, m2_ch,
-                      window=10, save_path=None, show=True):
-    """
-    Plot two metrics from a single log on twin y-axes.
-    Left axis  = metric 1 (blue tones)
-    Right axis = metric 2 (orange tones)
-    """
-    log      = entry['log']
-    label    = entry['label']
-    ma_kern  = np.ones(window) / window
+def cmd_log(args):
+    # resolve log files
+    log_files  = []
+    log_labels = []
 
-    itr = np.array(log['itr_axis'])
+    for i, src in enumerate(args.log):
+        lbl = args.label[i] if args.label and i < len(args.label) \
+              else os.path.basename(os.path.dirname(src)).replace('_', ' ')
+        if os.path.isdir(src):
+            candidates = [
+                os.path.join(src, 'data', 'stage2_all_epochs_raw.pt'),
+                os.path.join(src, 'stage2_all_epochs_raw.pt'),
+            ]
+            found = next((p for p in candidates if os.path.exists(p)), None)
+            if found is None:
+                print(f'ERROR: cannot find log in {src}'); continue
+            log_files.append(found)
+        else:
+            log_files.append(src)
+        log_labels.append(lbl)
 
-    def _prep(key, ch):
-        _, vals = get_series(log, key, ch)
-        if key in USE_LOG_SCALE:
-            vals = np.where(vals == 0, np.nan, vals)
-        return vals
+    if not log_files:
+        print('ERROR: no valid log files found'); return
 
-    v1 = _prep(m1_key, m1_ch)
-    v2 = _prep(m2_key, m2_ch)
+    entries = []
+    for fp, lbl in zip(log_files, log_labels):
+        try:
+            entries.append({'label': lbl, 'log': load_log(fp)})
+            print(f'Loaded log: {lbl}  ({fp})')
+        except Exception as e:
+            print(f'ERROR loading {fp}: {e}')
 
-    t1 = METRIC_LABELS.get(m1_key, m1_key) + (f' — ch {m1_ch}' if m1_ch is not None else '')
-    t2 = METRIC_LABELS.get(m2_key, m2_key) + (f' — ch {m2_ch}' if m2_ch is not None else '')
+    if not entries:
+        return
 
-    fig, ax1 = plt.subplots(figsize=(12, 5))
-    fig.suptitle(f'{label}', fontsize=12)
+    # list available metrics if requested
+    if args.list_metrics:
+        log = entries[0]['log']
+        print('\nAvailable metrics:')
+        for k in LOG_SCALAR_KEYS:
+            if k in log:
+                print(f'  {k}')
+        for k in LOG_PER_CH_KEYS:
+            if k in log:
+                for ch in sorted(log[k].keys()):
+                    print(f'  {k}:{ch}')
+        return
 
-    c1 = COLORS[0]   # blue family
-    c2 = COLORS[1]   # orange family
+    # parse metric
+    key = args.metric
+    ch  = None
+    if ':' in key:
+        key, ch = key.split(':', 1)
+        ch = int(ch)
 
-    # ── left axis ─────────────────────────────────────────────────────────────
-    pf1 = ax1.semilogy if m1_key in USE_LOG_SCALE else ax1.plot
-    ax1.set_xlabel('Iteration')
-    ax1.set_ylabel(t1, color=c1)
-    ax1.tick_params(axis='y', labelcolor=c1)
-
-    pf1(itr, v1, color=c1, alpha=0.25, linewidth=1)
-    valid1 = ~np.isnan(v1)
-    if valid1.sum() >= window:
-        ma1 = np.convolve(v1[valid1], ma_kern, mode='valid')
-        pf1(itr[valid1][window - 1:], ma1, color=c1, linewidth=2,
-            marker='o', markevery=max(1, len(ma1) // 15),
-            markersize=5, label=t1)
-    else:
-        pf1(itr[valid1], v1[valid1], color=c1, linewidth=2, label=t1)
-
-    # ── right axis ────────────────────────────────────────────────────────────
-    ax2 = ax1.twinx()
-    pf2 = ax2.semilogy if m2_key in USE_LOG_SCALE else ax2.plot
-    ax2.set_ylabel(t2, color=c2)
-    ax2.tick_params(axis='y', labelcolor=c2)
-
-    pf2(itr, v2, color=c2, alpha=0.25, linewidth=1)
-    valid2 = ~np.isnan(v2)
-    if valid2.sum() >= window:
-        ma2 = np.convolve(v2[valid2], ma_kern, mode='valid')
-        pf2(itr[valid2][window - 1:], ma2, color=c2, linewidth=2,
-            linestyle='--', marker='^',
-            markevery=max(1, len(ma2) // 15),
-            markersize=5, label=t2)
-    else:
-        pf2(itr[valid2], v2[valid2], color=c2, linewidth=2,
-            linestyle='--', label=t2)
-
-    # combined legend outside
-    h1, l1 = ax1.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax1.legend(h1 + h2, l1 + l2, loc='upper left',
-               bbox_to_anchor=(1.08, 1), borderaxespad=0, fontsize=9)
-
-    ax1.grid(True, which='both', linestyle='--', linewidth=0.4, alpha=0.6)
-    fig.tight_layout(rect=[0, 0, 0.80, 1])
-
-    if save_path:
-        fig.savefig(save_path, bbox_inches='tight', dpi=150)
-        print(f'Dual-metric plot saved to {save_path}')
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+    plot_log_comparison(entries, key, ch, window=args.window, save_path=args.save)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Variation helpers  (Tab 3)
+# Variation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def discover_subfolders(main_folder: str) -> list[str]:
-    """
-    Return sorted list of immediate sub-folder names inside *main_folder*
-    that contain at least one model with outputs/SNR.pt + outputs/worst_BER.pt.
-    """
+def discover_subfolders(main_folder):
     result = []
     if not os.path.isdir(main_folder):
         return result
@@ -2107,16 +361,7 @@ def discover_subfolders(main_folder: str) -> list[str]:
     return result
 
 
-def discover_models_in_subfolders(main_folder: str,
-                                   subfolders: list[str]) -> list[dict]:
-    """
-    For each sub-folder name in *subfolders*, walk its model directories and
-    collect every model that has outputs/SNR.pt + outputs/worst_BER.pt.
-
-    Returns a list of dicts:
-        { 'label':        '<subfolder> / <model_name>',
-          'outputs_path': full path to the outputs folder }
-    """
+def discover_models_in_subfolders(main_folder, subfolders):
     found = []
     for sf in subfolders:
         sfp = os.path.join(main_folder, sf)
@@ -2129,30 +374,18 @@ def discover_models_in_subfolders(main_folder: str,
             out = os.path.join(vmp, 'outputs')
             if (os.path.isfile(os.path.join(out, 'SNR.pt')) and
                     os.path.isfile(os.path.join(out, 'worst_BER.pt'))):
-                found.append({'label': f'{sf} / {model_name}',
-                              'outputs_path': out})
+                found.append({'label': f'{sf} / {model_name}', 'outputs_path': out})
     return found
 
 
-def load_variation_ber(outputs_path: str,
-                       snr_targets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Load SNR.pt and worst_BER.pt from *outputs_path*.
-    For each value in *snr_targets* find the closest recorded SNR point and
-    return matched (snr_matched, ber_matched) arrays.
-
-    worst_BER.pt may be shape [N_snr] or [N_channels, N_snr]; the latter is
-    reduced to the worst channel (max over axis 0).
-    """
+def load_variation_ber(outputs_path, snr_targets):
     snr_raw = torch.load(os.path.join(outputs_path, 'SNR.pt'), weights_only=True)
     ber_raw = torch.load(os.path.join(outputs_path, 'worst_BER.pt'), weights_only=True)
-
-    snr_np = (snr_raw.numpy() if torch.is_tensor(snr_raw) else np.array(snr_raw)).flatten()
-    ber_np = (ber_raw.numpy() if torch.is_tensor(ber_raw) else np.array(ber_raw))
+    snr_np  = (snr_raw.numpy() if torch.is_tensor(snr_raw) else np.array(snr_raw)).flatten()
+    ber_np  = (ber_raw.numpy() if torch.is_tensor(ber_raw) else np.array(ber_raw))
     if ber_np.ndim == 2:
         ber_np = ber_np.max(axis=0)
     ber_np = ber_np.flatten()
-
     matched_snr, matched_ber = [], []
     for t in snr_targets:
         idx = int(np.argmin(np.abs(snr_np - t)))
@@ -2161,37 +394,66 @@ def load_variation_ber(outputs_path: str,
     return np.array(matched_snr), np.array(matched_ber)
 
 
-def plot_variation_all(results: list[dict], main_bers=None, save_path=None, show=True):
-    """
-    Plot every individual model BER curve, plus optionally the main model.
-    results:  list of { 'label', 'snr': np.ndarray, 'ber': np.ndarray }
-    main_bers: list of { 'label', 'snr': np.ndarray, 'ber': np.ndarray } or None
+def load_main_ber(folder, snr_targets, main_label=None):
+    """Load stage-3 and stage-1 BER from <folder>/outputs/."""
+    out        = os.path.join(folder, 'outputs')
+    snr_f      = os.path.join(out, 'SNR.pt')
+    base_label = main_label or os.path.basename(os.path.normpath(folder))
+    if not os.path.isfile(snr_f):
+        print(f'  Main model: SNR.pt not found in {out}, skipping.')
+        return []
+    snr_raw = torch.load(snr_f, weights_only=True)
+    snr_np  = (snr_raw.numpy() if torch.is_tensor(snr_raw) else np.array(snr_raw)).flatten()
 
-    Paper-ready formatting:
-      • Double-column IEEE width (7 in × 4.5 in)
-      • Legend inside the axes (upper right) — ncol=2 if many entries
-      • Font sizes matching a 10 pt document
-      • 300 dpi / vector-friendly tight layout
-    To adjust: change PAPER_W/PAPER_H, FONT_* constants, or legend loc/ncol below.
-    """
-    # ── paper layout constants ── tweak these to taste ──────────────────────
-    PAPER_W   = 7.0          # figure width  in inches (3.5 = single col, 7 = double col)
-    PAPER_H   = 4.5          # figure height in inches
-    FONT_AX   = 11           # axis-label font size
-    FONT_TICK = 10           # tick-label font size
-    FONT_LEG  = 8            # legend font size
-    SAVE_DPI  = 300          # resolution for raster formats (png); irrelevant for pdf/eps
-    LEG_LOC   = 'upper right'  # legend anchor inside the axes
-    LEG_NCOL  = 2            # legend columns (increase to fit more entries per row)
-    # ────────────────────────────────────────────────────────────────────────
+    results = []
+    for stage in (3, 1):
+        ber_f = os.path.join(out, f'worst_BER_stage_{stage}.pt')
+        if not os.path.isfile(ber_f):
+            continue
+        ber_raw = torch.load(ber_f, weights_only=True)
+        ber_np  = (ber_raw.numpy() if torch.is_tensor(ber_raw) else np.array(ber_raw))
+        if ber_np.ndim == 2:
+            ber_np = ber_np.max(axis=0)
+        ber_np = ber_np.flatten()
+        matched_snr, matched_ber = [], []
+        for t in snr_targets:
+            idx = int(np.argmin(np.abs(snr_np - t)))
+            matched_snr.append(snr_np[idx])
+            matched_ber.append(ber_np[idx])
+        results.append({'label': f'{base_label}  (main stage {stage})',
+                        'snr': np.array(matched_snr), 'ber': np.array(matched_ber)})
+        print(f'  Main stage {stage} loaded.')
+    return results
 
+
+# ── paper-ready layout constants (edit here to tune output) ──────────────────
+PAPER_W, PAPER_H = 7.0, 4.5
+FONT_AX, FONT_TICK, FONT_LEG = 11, 10, 8
+SAVE_DPI = 300
+LEG_LOC, LEG_NCOL = 'upper right', 2
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _add_main_bers(ax, main_bers):
+    """Overlay main model BER lines and return the lowest non-zero BER."""
+    ylim = 1e-10
+    styles = [dict(color='black', linestyle='-', marker='o'),
+              dict(color='dimgray', linestyle='--', marker='s')]
+    for j, mb in enumerate(main_bers or []):
+        snr, ber = mb['snr'], mb['ber']
+        ber_plot = np.where(ber > 0, ber, np.nan)
+        if ~np.isnan(ber_plot).all():
+            ylim = max(ylim, ber_plot[~np.isnan(ber_plot)].min())
+        ax.semilogy(snr, ber_plot, linewidth=2.0, markersize=5,
+                    label=mb['label'], zorder=5, **styles[j % len(styles)])
+    return ylim
+
+
+def plot_variation_all(results, main_bers=None, save_path=None):
     fig, ax = plt.subplots(figsize=(PAPER_W, PAPER_H))
     ax.set_xlabel('SNR (dB)', fontsize=FONT_AX)
     ax.set_ylabel('Worst BER', fontsize=FONT_AX)
     ax.tick_params(axis='both', labelsize=FONT_TICK)
     ax.grid(True, which='both', linestyle='--', linewidth=0.4, alpha=0.6)
-    print(f"found {len(results)} models to compare")
-
     for i, entry in enumerate(results):
         color  = COLORS[i % len(COLORS)]
         marker = MARKERS[i % len(MARKERS)]
@@ -2203,169 +465,147 @@ def plot_variation_all(results: list[dict], main_bers=None, save_path=None, show
                     y[mask]   if mask.any() else y,
                     marker=marker, color=color, linewidth=1.5,
                     markersize=4, label=lbl)
-
-    ylim = 1e-10
-    main_styles = [
-        dict(color='black',   linestyle='-',  marker='o'),
-        dict(color='dimgray', linestyle='--', marker='s'),
-    ]
-    for j, mb in enumerate(main_bers or []):
-        snr, ber = mb['snr'], mb['ber']
-        ber_plot = np.where(ber > 0, ber, np.nan)
-        if ~np.isnan(ber_plot).all():
-            ylim = max(ylim, ber_plot[~np.isnan(ber_plot)].min())
-        st = main_styles[j % len(main_styles)]
-        ax.semilogy(snr, ber_plot, linewidth=2.0, markersize=5,
-                    label=mb['label'], zorder=5, **st)
-
+    ylim = _add_main_bers(ax, main_bers)
     ax.set_ylim([ylim, 1])
     ax.legend(loc=LEG_LOC, ncol=LEG_NCOL, fontsize=FONT_LEG,
               handlelength=1.5, handletextpad=0.4, labelspacing=0.3,
               columnspacing=1.0, framealpha=0.85)
     fig.tight_layout()
-
-    if save_path:
-        fig.savefig(save_path, bbox_inches='tight', dpi=SAVE_DPI)
-        print(f'All-models plot saved to {save_path}')
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+    savefig(fig, save_path, dpi=SAVE_DPI)
 
 
-def plot_variation_envelope(folder_results: list[dict], main_bers=None, save_path=None, show=True):
-    """
-    For each sub-folder plot worst/best BER envelope with filled area.
-    Single-model folders draw one line (no best/worst suffix).
-
-    folder_results: list of {
-        'label':   sub-folder name,
-        'snr':     np.ndarray  [N_snr],
-        'ber_mat': np.ndarray  [N_models, N_snr]
-    }
-
-    Paper-ready formatting:
-      • Double-column IEEE width (7 in × 4.5 in)
-      • Legend inside the axes — ncol=2 keeps it compact for two-column papers
-      • Font sizes matching a 10 pt document
-      • 300 dpi tight layout
-    To adjust: change PAPER_W/PAPER_H, FONT_* constants, or LEG_LOC/LEG_NCOL below.
-    """
-    # ── paper layout constants ── tweak these to taste ──────────────────────
-    PAPER_W   = 7.0          # figure width  in inches (3.5 = single col, 7 = double col)
-    PAPER_H   = 4.5          # figure height in inches
-    FONT_AX   = 11           # axis-label font size
-    FONT_TICK = 10           # tick-label font size
-    FONT_LEG  = 8            # legend font size
-    SAVE_DPI  = 300          # dpi for raster formats; irrelevant for pdf/eps
-    LEG_LOC   = 'upper right'  # legend anchor inside the axes
-    LEG_NCOL  = 2            # legend columns (increase if many entries)
-    # ────────────────────────────────────────────────────────────────────────
-
+def plot_variation_envelope(folder_results, main_bers=None, save_path=None):
     import warnings
     fig, ax = plt.subplots(figsize=(PAPER_W, PAPER_H))
     ax.set_xlabel('SNR (dB)', fontsize=FONT_AX)
     ax.set_ylabel('Worst BER', fontsize=FONT_AX)
     ax.tick_params(axis='both', labelsize=FONT_TICK)
     ax.grid(True, which='both', linestyle='--', linewidth=0.4, alpha=0.6)
-    print(f"found {len(folder_results)} sub-folders to compare")
 
     for i, entry in enumerate(folder_results):
         color    = COLORS[i % len(COLORS)]
         snr      = entry['snr']
         mat      = entry['ber_mat']
         n_models = mat.shape[0]
-
         mat_safe = np.where(mat > 0, mat, np.nan)
 
-        all_nan_cols = np.all(np.isnan(mat_safe), axis=0)
-        if all_nan_cols.any():
-            bad_snr = snr[all_nan_cols]
-            print(f'  Warning [{entry["label"]}]: all models have BER=0 '
-                  f'at SNR = {bad_snr} dB — those points will be skipped.')
+        all_nan = np.all(np.isnan(mat_safe), axis=0)
+        if all_nan.any():
+            print(f'  Warning [{entry["label"]}]: BER=0 at SNR = {snr[all_nan]} dB — skipped.')
 
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', category=RuntimeWarning,
                                     message='All-NaN slice encountered')
             worst = np.nanmax(mat_safe, axis=0)
             best  = np.nanmin(mat_safe, axis=0)
-
         valid = ~(np.isnan(worst) | np.isnan(best))
 
         if n_models == 1:
             ax.semilogy(snr[valid], worst[valid], color=color, linewidth=1.5,
-                        marker='o', markersize=4, markevery=1,
-                        label=entry['label'])
+                        marker='o', markersize=4, label=entry['label'])
         else:
             ax.semilogy(snr[valid], worst[valid], color=color, linewidth=1.5,
-                        marker='^', markersize=4, markevery=1,
+                        marker='^', markersize=4,
                         label=f'{entry["label"]}  worst')
             ax.semilogy(snr[valid], best[valid], color=color, linewidth=1.5,
-                        linestyle='--', marker='v', markersize=4, markevery=1,
+                        linestyle='--', marker='v', markersize=4,
                         label=f'{entry["label"]}  best')
             if valid.any():
                 ax.fill_between(snr[valid], best[valid], worst[valid],
                                 color=color, alpha=0.18)
 
-    ylim = 1e-10
-    main_styles = [
-        dict(color='black',   linestyle='-',  marker='o'),
-        dict(color='dimgray', linestyle='--', marker='s'),
-    ]
-    for j, mb in enumerate(main_bers or []):
-        snr, ber = mb['snr'], mb['ber']
-        ber_plot = np.where(ber > 0, ber, np.nan)
-        if ~np.isnan(ber_plot).all():
-            ylim = max(ylim, ber_plot[~np.isnan(ber_plot)].min())
-        st = main_styles[j % len(main_styles)]
-        ax.semilogy(snr, ber_plot, linewidth=2.0, markersize=5,
-                    label=mb['label'], zorder=5, **st)
-
+    ylim = _add_main_bers(ax, main_bers)
     ax.set_ylim([ylim, 1])
     ax.legend(loc=LEG_LOC, ncol=LEG_NCOL, fontsize=FONT_LEG,
               handlelength=1.5, handletextpad=0.4, labelspacing=0.3,
               columnspacing=1.0, framealpha=0.85)
     fig.tight_layout()
+    savefig(fig, save_path, dpi=SAVE_DPI)
 
-    if save_path:
-        fig.savefig(save_path, bbox_inches='tight', dpi=SAVE_DPI)
-        print(f'Envelope plot saved to {save_path}')
-    if show:
-        plt.show()
+
+def cmd_variation(args):
+    folder = args.main
+    snr_min = args.snr_min
+    if snr_min is None:
+        val = read_max_snr_stage1(folder)
+        snr_min = (val - 10) if val is not None else -20.0
+        print(f'Auto SNR min: {snr_min:.1f} dB')
+
+    snr_targets = np.arange(snr_min, args.snr_max + args.snr_step * 0.5, args.snr_step)
+
+    # resolve sub-folders
+    if args.subfolders:
+        sf_list = args.subfolders
     else:
-        plt.close(fig)
+        sf_list = discover_subfolders(folder)
+        if not sf_list:
+            print('No valid sub-folders found.'); return
+        print(f'Auto-discovered sub-folders: {sf_list}')
 
+    sf_labels = {}
+    if args.sf_labels:
+        for pair in args.sf_labels:
+            k, v = pair.split('=', 1)
+            sf_labels[k] = v
+
+    main_bers = load_main_ber(folder, snr_targets, main_label=args.main_label)
+
+    if args.mode == 'all':
+        models = discover_models_in_subfolders(folder, sf_list)
+        if not models:
+            print('No valid models found.'); return
+        results = []
+        for m in models:
+            sf_part    = m['label'].split(' / ')[0]
+            model_part = m['label'].split(' / ', 1)[1] if ' / ' in m['label'] else m['label']
+            lbl        = f"{sf_labels.get(sf_part, sf_part)} / {model_part}"
+            try:
+                snr_m, ber_m = load_variation_ber(m['outputs_path'], snr_targets)
+                results.append({'label': lbl, 'snr': snr_m, 'ber': ber_m})
+                print(f'  Loaded: {lbl}')
+            except Exception as e:
+                print(f'  ERROR {lbl}: {e}')
+        if results:
+            plot_variation_all(results, main_bers=main_bers, save_path=args.save)
+
+    else:  # envelope
+        folder_results = []
+        for sf_name in sf_list:
+            models = discover_models_in_subfolders(folder, [sf_name])
+            if not models:
+                print(f'  No models in {sf_name}'); continue
+            ber_rows = []
+            for m in models:
+                try:
+                    _, ber_m = load_variation_ber(m['outputs_path'], snr_targets)
+                    ber_rows.append(ber_m)
+                except Exception as e:
+                    print(f'  ERROR {m["label"]}: {e}')
+            if not ber_rows:
+                continue
+            snr_rep, _ = load_variation_ber(models[0]['outputs_path'], snr_targets)
+            lbl = sf_labels.get(sf_name, sf_name)
+            folder_results.append({'label': lbl, 'snr': snr_rep,
+                                   'ber_mat': np.vstack(ber_rows)})
+            print(f'  {lbl}: {len(ber_rows)} model(s)')
+        if folder_results:
+            plot_variation_envelope(folder_results, main_bers=main_bers, save_path=args.save)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Architecture & Constellation helpers  (Tab 4)
+# Architecture
 # ─────────────────────────────────────────────────────────────────────────────
 
-def int_to_binary(integers, n_bits):
-    """Convert integer tensor to binary matrix [N, n_bits] MSB-first."""
-    mask = 2 ** torch.arange(n_bits - 1, -1, -1)
-    return ((integers.unsqueeze(-1) & mask) > 0).int()
-
-
-def plot_architecture(model, folder_path, save_path=None, show=True):
-    """
-    Spatial scatter plot.
-    TX  — upward triangle  (^)  large, with black edge
-    RX  — downward triangle (v)  large, with black edge
-    Relay — circle (o)
-    Each channel gets a distinct jet color. Relays colored by dominant channel (P >= 0.5).
-    """
+def plot_architecture(model, folder_path, save_path=None):
     def _pt(name):
         return torch.load(os.path.join(folder_path, 'data', name + '.pt'),
                           weights_only=False)
-
     posT = _pt('posT')
     posR = _pt('posR')
     posU = _pt('posU')
 
     C        = model.N_channels
     N_relays = model.N_relays
-
     model.update_v()
     model.culc_p()
 
@@ -2378,22 +618,18 @@ def plot_architecture(model, folder_path, save_path=None, show=True):
     fig    = plt.figure(figsize=(12, 10))
 
     for c in range(C):
-        col = colors(c)
-
+        col  = colors(c)
         plt.scatter(float(posT[c, 0]), float(posT[c, 1]),
                     marker='^', label=f'TX - channel {c}',
-                    color=col, s=300, zorder=5,
-                    edgecolors='black', linewidths=0.6)
-
+                    color=col, s=300, zorder=5, edgecolors='black', linewidths=0.6)
         mask = np.squeeze(color_RR == c + 1)
         if mask.any():
             plt.scatter(posR[mask, 0].numpy(), posR[mask, 1].numpy(),
                         marker='o', color=col,
                         label=f'relay - channel - {c}', s=200, zorder=3,
                         edgecolors='black', linewidths=0.4)
-
-        pu = posU[c]
-        pu_np = pu.numpy() if torch.is_tensor(pu) else np.array(pu)
+        pu     = posU[c]
+        pu_np  = pu.numpy() if torch.is_tensor(pu) else np.array(pu)
         if pu_np.ndim == 1:
             pu_np = pu_np.reshape(1, -1)
         plt.scatter(pu_np[:, 0], pu_np[:, 1],
@@ -2401,39 +637,24 @@ def plot_architecture(model, folder_path, save_path=None, show=True):
                     label=f'RX - channel - {c}', s=300, zorder=5,
                     edgecolors='black', linewidths=0.6)
 
-    plt.xticks([])
-    plt.yticks([])
+    plt.xticks([]); plt.yticks([])
     plt.legend(bbox_to_anchor=(0., 1.02, 1., .102), loc='lower left',
                ncols=3 * C, mode='expand', borderaxespad=0.)
     plt.tight_layout()
-
-    if save_path:
-        fig.savefig(save_path, bbox_inches='tight', dpi=150)
-        print(f'Architecture plot saved to {save_path}')
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+    savefig(fig, save_path)
 
 
-def plot_constellation(model, snr_db=10.0, n_itr=1, save_path=None, show=True):
-    """
-    One figure per channel, one figure per RX user within that channel.
+def cmd_arch(args):
+    print(f'Loading model from {args.model}, stage {args.stage}')
+    model = load_model(args.model, args.stage)
+    plot_architecture(model, folder_path=args.model, save_path=args.save)
 
-    Figure 1 — TX antennas (one subplot per antenna, side by side):
-        Shows the transmitted constellation with bit-string labels.
 
-    Figure 2..N_users+1 — per RX user:
-        Grid of N_symbols subplots (one per transmitted symbol).
-        Each cell shows the received cloud for that specific symbol only,
-        so overlapping symbols are split apart into separate panels.
-        Color inside each panel = transmit symbol color (consistent with TX figure).
+# ─────────────────────────────────────────────────────────────────────────────
+# Constellation
+# ─────────────────────────────────────────────────────────────────────────────
 
-    n_itr > 1 stacks multiple noisy passes to show the full noise cloud.
-    """
-    import matplotlib.patches as mpatches
-    import math as _math
-
+def plot_constellation(model, snr_db=10.0, n_itr=1, save_path=None):
     snr_lin  = dB2lin(snr_db)
     C        = model.N_channels
     sym_cmap = plt.get_cmap('tab20')
@@ -2444,7 +665,6 @@ def plot_constellation(model, snr_db=10.0, n_itr=1, save_path=None, show=True):
         N_users_c = int(model.N_users[c])
         N_symbols = 2 ** N_users_c
 
-        # ── build symbol set ──────────────────────────────────────────────────
         bits = int_to_binary(torch.arange(0, N_symbols), N_users_c).to(torch.complex64)
         if model.demod_type == 'complex':
             s = sub.transmitNN(bits).detach()
@@ -2454,7 +674,7 @@ def plot_constellation(model, snr_db=10.0, n_itr=1, save_path=None, show=True):
                     torch.linspace(0, N_users_c - 1, N_users_c), dim=1)
                 * bits.T, dim=0
             ).real.to(torch.int32)
-            s = sub.modulation[symbols_int]   # [N_symbols] complex
+            s = sub.modulation[symbols_int]
 
         print(f'Channel {c}: max TX amplitude^2 = {torch.max(s.abs() ** 2).item():.4f}')
 
@@ -2463,15 +683,13 @@ def plot_constellation(model, snr_db=10.0, n_itr=1, save_path=None, show=True):
             s_plot = s_plot.unsqueeze(1)
         N_tx_plot = s_plot.shape[1]
 
-        # ── forward passes ────────────────────────────────────────────────────
         rm_runs = []
         with torch.no_grad():
             for _ in range(n_itr):
                 if model.demod_type == 'complex':
-                    rm = sub(s, bits.real.T).detach().T  # [N_symbols, N_users_c]
+                    rm = sub(s, bits.real.T).detach().T
                 else:
                     rm = torch.squeeze(sub(s, bits.real.T).detach(), 1).T
-
                 rm_runs.append(rm)
 
         bits_labels = [
@@ -2481,22 +699,18 @@ def plot_constellation(model, snr_db=10.0, n_itr=1, save_path=None, show=True):
         ]
         sym_colors = [sym_cmap(sym / max(N_symbols - 1, 1)) for sym in range(N_symbols)]
 
-        def _save(fig, suffix):
+        def _save_ch(fig, suffix):
             if save_path:
                 base, ext = os.path.splitext(save_path)
                 ext = ext or '.png'
-                p = f'{base}_ch{c}_{suffix}{ext}'
-                fig.savefig(p, bbox_inches='tight', dpi=150)
-                print(f'Saved: {p}')
-                plt.close(fig)
+                savefig(fig, f'{base}_ch{c}_{suffix}{ext}')
+            else:
+                savefig(fig, None)
 
-        # ── Figure 1: TX constellation ────────────────────────────────────────
-        fig_tx, axes_tx = plt.subplots(1, N_tx_plot,
-                                       figsize=(6 * N_tx_plot, 6),
+        # ── TX figure ────────────────────────────────────────────────────────
+        fig_tx, axes_tx = plt.subplots(1, N_tx_plot, figsize=(6 * N_tx_plot, 6),
                                        squeeze=False)
-        fig_tx.suptitle(f'Channel {c}  |  TX  |  SNR = {snr_db:.1f} dB',
-                        fontsize=13)
-
+        fig_tx.suptitle(f'Channel {c}  |  TX  |  SNR = {snr_db:.1f} dB', fontsize=13)
         for tx_idx in range(N_tx_plot):
             ax = axes_tx[0, tx_idx]
             for sym in range(N_symbols):
@@ -2509,7 +723,7 @@ def plot_constellation(model, snr_db=10.0, n_itr=1, save_path=None, show=True):
                             textcoords='offset points', xytext=(6, 6),
                             fontsize=9, fontweight='bold')
             ax.set_title(f'TX antenna {tx_idx}', fontsize=11)
-            ax.set_xlabel('Real');  ax.set_ylabel('Imag')
+            ax.set_xlabel('Real'); ax.set_ylabel('Imag')
             ax.grid(True, linestyle='--', alpha=0.4)
             ax.axhline(0, color='gray', lw=0.5)
             ax.axvline(0, color='gray', lw=0.5)
@@ -2517,35 +731,27 @@ def plot_constellation(model, snr_db=10.0, n_itr=1, save_path=None, show=True):
                        for s in range(N_symbols)]
             ax.legend(handles=handles, title='Symbol', fontsize=7,
                       ncol=max(1, N_symbols // 4), loc='best')
-
         fig_tx.tight_layout()
-        _save(fig_tx, 'TX')
+        _save_ch(fig_tx, 'TX')
 
-        # ── One figure per RX user — all symbols on a single plot ──────────
+        # ── RX figures (one per user) ─────────────────────────────────────────
         for u in range(N_users_c):
             fig_rx, ax = plt.subplots(figsize=(7, 7))
             fig_rx.suptitle(
                 f'Channel {c}  |  RX user {u}  |  SNR = {snr_db:.1f} dB  '
-                f'({n_itr} iteration{"s" if n_itr > 1 else ""})',
-                fontsize=13)
-
+                f'({n_itr} iteration{"s" if n_itr > 1 else ""})', fontsize=13)
             for sym in range(N_symbols):
                 pts = torch.stack([rm_runs[it][sym, u] for it in range(n_itr)])
                 ax.scatter(pts.real.numpy(), pts.imag.numpy(),
-                           color=sym_colors[sym], s=20, alpha=0.6,
-                           zorder=3, label=bits_labels[sym])
-                # centroid marker
+                           color=sym_colors[sym], s=20, alpha=0.6, zorder=3)
                 cx = pts.real.mean().item()
                 cy = pts.imag.mean().item()
                 ax.scatter([cx], [cy], color=sym_colors[sym], s=80,
                            marker='+', zorder=5, linewidths=2)
                 ax.annotate(bits_labels[sym], (cx, cy),
                             textcoords='offset points', xytext=(6, 6),
-                            fontsize=9, fontweight='bold',
-                            color=sym_colors[sym])
-
-            ax.set_xlabel('Real', fontsize=10)
-            ax.set_ylabel('Imag', fontsize=10)
+                            fontsize=9, fontweight='bold', color=sym_colors[sym])
+            ax.set_xlabel('Real', fontsize=10); ax.set_ylabel('Imag', fontsize=10)
             ax.grid(True, linestyle='--', alpha=0.4)
             ax.axhline(0, color='gray', lw=0.5)
             ax.axvline(0, color='gray', lw=0.5)
@@ -2553,892 +759,437 @@ def plot_constellation(model, snr_db=10.0, n_itr=1, save_path=None, show=True):
                        for s in range(N_symbols)]
             ax.legend(handles=handles, title='Symbol', fontsize=8,
                       ncol=max(1, N_symbols // 4), loc='best')
-
             fig_rx.tight_layout()
-            _save(fig_rx, f'RX_user{u}')
-    if show:
-        plt.show()
+            _save_ch(fig_rx, f'RX_user{u}')
 
 
+def cmd_const(args):
+    print(f'Loading model from {args.model}, stage {args.stage}')
+    model = load_model(args.model, args.stage)
+    plot_constellation(model, snr_db=args.snr, n_itr=args.itr, save_path=args.save)
 
 
-# GUI
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Interactive wizard helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-class App(ctk.CTk):
-    def __init__(self):
-        super().__init__()
-        self.title('Model Comparison Tool')
-        self.resizable(True, True)
-        self._ber_rows: list[dict] = []
-        self._log_rows: list[dict] = []
-        self._build_ui()
-
-    # ── top-level notebook ────────────────────────────────────────────────────
-
-    def _build_ui(self):
-        nb = ctk.CTkTabview(self)
-        nb.pack(fill='both', expand=True, padx=6, pady=6)
-
-        nb.add('  BER Comparison  ')
-        nb.add('  Log Comparison  ')
-        nb.add('  Variation Comparison  ')
-        nb.add('  Architecture & Constellation  ')
-
-        self._tab_ber  = nb.tab('  BER Comparison  ')
-        self._tab_log  = nb.tab('  Log Comparison  ')
-        self._tab_var  = nb.tab('  Variation Comparison  ')
-        self._tab_arch = nb.tab('  Architecture & Constellation  ')
-
-        self._build_ber_tab(self._tab_ber)
-        self._build_log_tab(self._tab_log)
-        self._build_var_tab(self._tab_var)
-        self._build_arch_tab(self._tab_arch)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # TAB 1 — BER
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _build_ber_tab(self, parent):
-        pad = dict(padx=8, pady=4)
-
-        lf_models = ctk.CTkFrame(parent)
-        lf_models.grid(row=0, column=0, columnspan=2, sticky='nsew', **pad)
-        ctk.CTkLabel(lf_models, text='Models', font=ctk.CTkFont(size=13, weight='bold')).pack(anchor='w', padx=8, pady=(6,2))
-        self._ber_inner = ctk.CTkScrollableFrame(lf_models, height=120)
-        self._ber_inner.pack(fill='both', expand=True, padx=4, pady=4)
-        ctk.CTkButton(lf_models, text='＋  Add model folder',
-                      command=self._ber_add).pack(anchor='w', **pad)
-
-        lf_eval = ctk.CTkFrame(parent)
-        lf_eval.grid(row=1, column=0, sticky='nsew', **pad)
-        ctk.CTkLabel(lf_eval, text='Evaluation settings', font=ctk.CTkFont(size=12, weight='bold')).grid(
-            row=0, column=0, columnspan=2, padx=8, pady=(6,2))
-
-        def _erow(label, default, r):
-            ctk.CTkLabel(lf_eval, text=label, anchor='w').grid(row=r, column=0, sticky='w', **pad)
-            v = tk.StringVar(value=default)
-            ctk.CTkEntry(lf_eval, textvariable=v, width=90).grid(row=r, column=1, **pad)
-            return v
-
-        self._snr_min  = _erow('SNR min (dB)',   '-20',  1)
-        self._snr_max  = _erow('SNR max (dB)',   '40',   2)
-        self._snr_step = _erow('SNR step (dB)',  '1',    3)
-        self._batch    = _erow('Batch size',     '1000', 4)
-        self._n_itr    = _erow('Avg iterations', '10',   5)
-
-        lf_out = ctk.CTkFrame(parent)
-        lf_out.grid(row=1, column=1, sticky='nsew', **pad)
-        ctk.CTkLabel(lf_out, text='Output', font=ctk.CTkFont(size=12, weight='bold')).grid(
-            row=0, column=0, columnspan=3, padx=8, pady=(6,2))
-        ctk.CTkLabel(lf_out, text='Save plot to (optional)', anchor='w').grid(
-            row=1, column=0, sticky='w', **pad)
-        self._ber_save = tk.StringVar()
-        ctk.CTkEntry(lf_out, textvariable=self._ber_save, width=220).grid(row=1, column=1, **pad)
-        ctk.CTkButton(lf_out, text='Browse…', width=80,
-                      command=lambda: self._browse_save(self._ber_save)).grid(row=1, column=2, **pad)
-        self._ber_show = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(lf_out, text='Show plot interactively',
-                        variable=self._ber_show, onvalue=True, offvalue=False).grid(
-            row=2, column=0, columnspan=3, sticky='w', **pad)
-
-        ctk.CTkButton(parent, text='▶  Run BER comparison',
-                      font=ctk.CTkFont(size=13, weight='bold'),
-                      fg_color='#2E86AB', hover_color='#1a5f7a',
-                      command=self._ber_run).grid(row=2, column=0, columnspan=2,
-                                                  sticky='ew', padx=8, pady=8)
-        parent.columnconfigure(0, weight=1)
-        parent.columnconfigure(1, weight=1)
-
-    def _ber_add(self, path=''):
-        if not path:
-            path = filedialog.askdirectory(title='Select model folder')
-        if not path:
-            return
-        frame = ctk.CTkFrame(self._ber_inner, fg_color='transparent')
-        frame.pack(fill='x', pady=2)
-        display = path if len(path) <= 55 else '…' + path[-52:]
-        ctk.CTkLabel(frame, text=display, anchor='w', width=380,
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky='w')
-
-        ctk.CTkLabel(frame, text='Stages:').grid(row=0, column=1, padx=(8, 2))
-        stage_vars = {}
-        for col, s in enumerate((1, 2, 3), start=2):
-            var = tk.BooleanVar(value=(s == 3))
-            ctk.CTkCheckBox(frame, text=str(s), variable=var,
-                            onvalue=True, offvalue=False, width=50).grid(row=0, column=col, padx=2)
-            stage_vars[s] = var
-
-        ctk.CTkLabel(frame, text='Label:').grid(row=0, column=5, padx=(8, 2))
-        label_var = tk.StringVar(value=os.path.basename(path.rstrip('/\\')))
-        ctk.CTkEntry(frame, textvariable=label_var, width=200).grid(row=0, column=6, padx=2)
-
-        def _remove(f=frame):
-            f.destroy()
-            self._ber_rows = [r for r in self._ber_rows if r['frame'] is not f]
-
-        ctk.CTkButton(frame, text='✕', width=30, fg_color='#c0392b', hover_color='#922b21',
-                      command=_remove).grid(row=0, column=7, padx=(8, 0))
-        self._ber_rows.append(dict(path=path, stage_vars=stage_vars,
-                                   label_var=label_var, frame=frame))
-        if len(self._ber_rows) == 1:
-            max_snr = read_max_snr_stage1(path)
-            if max_snr is not None:
-                self._snr_min.set(str(int(round(max_snr - 10))))
-
-    def _ber_run(self):
-        rows = [r for r in self._ber_rows if r['frame'].winfo_exists()]
-        if not rows:
-            messagebox.showwarning('No models', 'Add at least one model folder.')
-            return
+def _ask(prompt, default=None):
+    """
+    Ask a question.  If default is given, show it and allow empty-Enter to accept.
+    Returns the user's string (stripped), or the default if Enter pressed.
+    """
+    if default is not None:
+        shown = f'  {prompt} [{default}]: '
+    else:
+        shown = f'  {prompt}: '
+    while True:
         try:
-            snr_min  = float(self._snr_min.get())
-            snr_max  = float(self._snr_max.get())
-            snr_step = float(self._snr_step.get())
-            batch    = int(self._batch.get())
-            num_itr  = int(self._n_itr.get())
-            snr_range = torch.arange(snr_min, snr_max + snr_step * 0.5, snr_step)
-        except ValueError as e:
-            messagebox.showerror('Invalid setting', str(e)); return
+            raw = input(shown).strip()
+        except (EOFError, KeyboardInterrupt):
+            print('\nAborted.')
+            sys.exit(0)
+        if raw == '' and default is not None:
+            return str(default)
+        if raw != '':
+            return raw
+        print('  (value required)')
 
-        save_path = self._ber_save.get().strip() or None
-        results   = []
-        for row in rows:
-            path  = row['path']
-            name  = row['label_var'].get().strip() or os.path.basename(path.rstrip('/\\'))
-            selected_stages = [s for s, var in row['stage_vars'].items() if var.get()]
-            if not selected_stages:
-                messagebox.showwarning('No stage selected',
-                                       f'Select at least one stage for:\n{name}')
-                continue
-            for stage in selected_stages:
-                print(f'\n{"="*55}\n  Loading: {name}  |  stage {stage}\n{"="*55}')
-                try:
-                    model = load_model(path, stage)
-                except Exception as e:
-                    messagebox.showerror('Load error',
-                                         f'Failed to load stage {stage}:\n{path}\n\n{e}')
-                    continue
-                ber = evaluate_model(model, snr_range, batch, num_itr)
-                results.append(dict(name=name, stage=stage, ber=ber))
-                if save_path:
-                    base = os.path.splitext(save_path)[0]
-                    safe = name.replace(' ', '_').replace('\\', '_').replace('/', '_')
-                    torch.save(ber, f'{base}_{safe}_stage{stage}_BER.pt')
-        if not results:
-            messagebox.showinfo('Done', 'No models evaluated.'); return
-        plot_ber_comparison(results, snr_range,
-                            save_path=save_path, show=self._ber_show.get())
 
-    def _build_log_tab(self, parent):
-        pad = dict(padx=8, pady=4)
+def _ask_yn(prompt, default=True):
+    """Yes/no question.  Returns bool."""
+    suffix = '[Y/n]' if default else '[y/N]'
+    raw = _ask(f'{prompt} {suffix}', default='y' if default else 'n')
+    return raw.lower() in ('y', 'yes', '1')
 
-        # ── top: log file list ────────────────────────────────────────────────
-        lf_logs = ctk.CTkFrame(parent)
-        lf_logs.grid(row=0, column=0, columnspan=3, sticky='nsew', **pad)
-        ctk.CTkLabel(lf_logs, text='Log files', font=ctk.CTkFont(size=12, weight='bold')).pack(anchor='w', padx=8, pady=(6,2))
 
-        self._log_inner = ctk.CTkScrollableFrame(lf_logs, height=120)
-        self._log_inner.pack(fill='both', expand=True, padx=4, pady=4)
+def _ask_default(prompt, default):
+    """Ask whether to keep a default; if not, ask for new value."""
+    if _ask_yn(f'{prompt} (default: {default}) — keep?', default=True):
+        return default
+    return _ask(prompt)
 
-        btn_row = ctk.CTkFrame(lf_logs, fg_color='transparent')
-        btn_row.pack(fill='x', pady=(4, 0))
-        ctk.CTkButton(btn_row, text='＋  Add log file (.pt)',
-                      command=self._log_add_file).pack(side='left', **pad)
-        ctk.CTkButton(btn_row, text='＋  Add model folder  (auto-finds log)',
-                      command=self._log_add_folder).pack(side='left', **pad)
 
-        # ── middle: metric selectors ──────────────────────────────────────────
-        lf_metric = ctk.CTkFrame(parent)
-        lf_metric.grid(row=1, column=0, sticky='nsew', **pad)
-        ctk.CTkLabel(lf_metric, text='Metrics to plot', font=ctk.CTkFont(size=12, weight='bold')).grid(
-            row=0, column=0, columnspan=3, padx=8, pady=(6,2))
+def _ask_path(prompt, must_exist=True):
+    """Ask for a filesystem path, optionally verifying it exists."""
+    while True:
+        val = _ask(prompt)
+        if not must_exist:
+            return val
+        if os.path.exists(val):
+            return val
+        print(f'  Path not found: {val}')
 
-        ctk.CTkLabel(lf_metric, text='Left axis (Y1):', anchor='w',
-                     font=ctk.CTkFont(weight='bold')).grid(row=1, column=0, sticky='w', **pad)
-        self._metric_var = tk.StringVar()
-        self._metric_cb  = ctk.CTkComboBox(lf_metric, variable=self._metric_var,
-                                            state='readonly', width=280)
-        self._metric_cb.grid(row=1, column=1, sticky='w', **pad)
 
-        self._metric2_label = ctk.CTkLabel(lf_metric, text='Right axis (Y2):', anchor='w',
-                                            font=ctk.CTkFont(weight='bold'))
-        self._metric2_label.grid(row=2, column=0, sticky='w', **pad)
-        self._metric2_var = tk.StringVar()
-        self._metric2_cb  = ctk.CTkComboBox(lf_metric, variable=self._metric2_var,
-                                             state='readonly', width=280)
-        self._metric2_cb.grid(row=2, column=1, sticky='w', **pad)
-        self._metric2_none_lbl = ctk.CTkLabel(lf_metric,
-                                               text='(available when only one log is loaded)',
-                                               text_color='gray', font=ctk.CTkFont(size=10))
-        self._metric2_none_lbl.grid(row=2, column=2, sticky='w', padx=4)
+def _ask_save():
+    """Ask for an optional save path."""
+    if _ask_yn('Save plot to file?', default=False):
+        return _ask('Save path (e.g. results/plot.png)', default=None)
+    return None
 
-        ctk.CTkButton(lf_metric, text='↺  Refresh', width=90,
-                      command=self._log_refresh_metrics).grid(row=1, column=2, **pad)
 
-        ctk.CTkLabel(lf_metric, text='MA window:').grid(row=3, column=0, sticky='w', **pad)
-        self._ma_var = tk.StringVar(value='10')
-        ctk.CTkEntry(lf_metric, textvariable=self._ma_var, width=60).grid(row=3, column=1,
-                                                                            sticky='w', **pad)
+def _ask_stage_multi():
+    """Ask which stages to use (checkboxes style)."""
+    print('  Which stage(s) to evaluate?')
+    stages = []
+    for s in (1, 2, 3):
+        if _ask_yn(f'    Stage {s}?', default=(s == 3)):
+            stages.append(s)
+    if not stages:
+        print('  (no stage selected, defaulting to stage 3)')
+        stages = [3]
+    return stages
 
-        # ── right: output ─────────────────────────────────────────────────────
-        lf_out = ctk.CTkFrame(parent)
-        lf_out.grid(row=1, column=1, sticky='nsew', **pad)
-        ctk.CTkLabel(lf_out, text='Output', font=ctk.CTkFont(size=12, weight='bold')).grid(
-            row=0, column=0, columnspan=3, padx=8, pady=(6,2))
-        ctk.CTkLabel(lf_out, text='Save plot to (optional)', anchor='w').grid(
-            row=1, column=0, sticky='w', **pad)
-        self._log_save = tk.StringVar()
-        ctk.CTkEntry(lf_out, textvariable=self._log_save, width=220).grid(row=1, column=1, **pad)
-        ctk.CTkButton(lf_out, text='Browse…', width=80,
-                      command=lambda: self._browse_save(self._log_save)).grid(row=1, column=2, **pad)
-        self._log_show = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(lf_out, text='Show plot interactively',
-                        variable=self._log_show, onvalue=True, offvalue=False).grid(
-            row=2, column=0, columnspan=3, sticky='w', **pad)
 
-        # ── run button ────────────────────────────────────────────────────────
-        ctk.CTkButton(parent, text='▶  Plot logs',
-                      font=ctk.CTkFont(size=13, weight='bold'),
-                      fg_color='#3D8A40', hover_color='#27632a',
-                      command=self._log_run).grid(row=2, column=0, columnspan=3,
-                                                  sticky='ew', padx=8, pady=8)
+def _separator():
+    print('\n' + '─' * 60)
 
-        parent.columnconfigure(0, weight=1)
-        parent.columnconfigure(1, weight=1)
 
-    # ── log row management ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-tab wizards
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def _log_add_file(self, filepath='', label_default=''):
-        """Add a row for a .pt log file."""
-        if not filepath:
-            filepath = filedialog.askopenfilename(
-                title='Select log .pt file',
-                filetypes=[('PyTorch files', '*.pt'), ('All files', '*.*')])
-        if not filepath:
-            return
-        try:
-            test = torch.load(filepath, weights_only=False)
-            if 'log' in test:
-                test = test['log']
-            assert 'itr_axis' in test, 'No itr_axis key — not a valid log file'
-        except Exception as e:
-            messagebox.showerror('Invalid log file', str(e)); return
+def wizard_ber():
+    _separator()
+    print('  BER COMPARISON')
+    print('  Evaluate BER vs SNR for one or more model/stage pairs.')
+    _separator()
 
-        frame = ctk.CTkFrame(self._log_inner, fg_color='transparent')
-        frame.pack(fill='x', pady=2)
+    # collect models
+    models, labels = [], []
+    print('\n  Add model folders (empty path to stop).')
+    idx = 1
+    while True:
+        path = _ask(f'Model {idx} folder (or Enter to stop)' if idx > 1
+                    else 'Model 1 folder', default=None if idx == 1 else '')
+        if path == '' and idx > 1:
+            break
+        if not os.path.exists(path):
+            print(f'  Path not found: {path}')
+            continue
+        lbl = _ask('  Label for this model',
+                   default=os.path.basename(os.path.normpath(path)))
+        models.append(path)
+        labels.append(lbl)
+        idx += 1
+        if idx > 1:
+            if not _ask_yn('\n  Add another model?', default=False):
+                break
 
-        display = filepath if len(filepath) <= 60 else '…' + filepath[-57:]
-        ctk.CTkLabel(frame, text=display, anchor='w', width=460,
-                     font=ctk.CTkFont(size=10)).grid(row=0, column=0, sticky='w')
-        ctk.CTkLabel(frame, text='Label:').grid(row=0, column=1, padx=(8, 2))
-        default_label = label_default or os.path.basename(
-            os.path.dirname(filepath)).replace('_', ' ')
-        label_var = tk.StringVar(value=default_label)
-        ctk.CTkEntry(frame, textvariable=label_var, width=160).grid(row=0, column=2, padx=2)
+    stages = _ask_stage_multi()
 
-        self._log_rows.append(dict(filepath=filepath, label_var=label_var, frame=frame))
+    # SNR range
+    print()
+    snr_min_auto = read_max_snr_stage1(models[0]) if models else None
+    snr_min_default = int(round(snr_min_auto - 10)) if snr_min_auto else -20
+    snr_min  = float(_ask_default('SNR min (dB)', snr_min_default))
+    snr_max  = float(_ask_default('SNR max (dB)', 40))
+    snr_step = float(_ask_default('SNR step (dB)', 1))
+    batch    = int(_ask_default('Batch size', 1000))
+    itr      = int(_ask_default('Avg iterations per SNR point', 10))
+    save     = _ask_save()
 
-        def _remove(f=frame):
-            f.destroy()
-            self._log_rows = [r for r in self._log_rows if r['frame'] is not f]
-            self._log_refresh_metrics()
+    # build args namespace and run
+    class A: pass
+    args = A()
+    args.model = models
+    args.label = labels
+    args.stage = stages
+    args.snr_min  = snr_min
+    args.snr_max  = snr_max
+    args.snr_step = snr_step
+    args.batch    = batch
+    args.itr      = itr
+    args.save     = save
+    cmd_ber(args)
 
-        ctk.CTkButton(frame, text='✕', width=30, fg_color='#c0392b', hover_color='#922b21',
-                      command=_remove).grid(row=0, column=3, padx=(8, 0))
 
-        self._log_refresh_metrics()
+def wizard_log():
+    _separator()
+    print('  LOG COMPARISON')
+    print('  Plot training metrics from one or more log files.')
+    _separator()
 
-    def _log_add_folder(self):
-        """Auto-find stage2_all_epochs_raw.pt inside a model folder."""
-        folder = filedialog.askdirectory(title='Select model folder')
-        if not folder:
-            return
-        candidates = [
-            os.path.join(folder, 'data', 'stage2_all_epochs_raw.pt'),
-            os.path.join(folder, 'stage2_all_epochs_raw.pt'),
-        ]
-        found = next((p for p in candidates if os.path.exists(p)), None)
-        if found is None:
-            found = filedialog.askopenfilename(
-                initialdir=os.path.join(folder, 'data'),
-                title=f'Cannot auto-find log in {folder} — select manually',
-                filetypes=[('PyTorch files', '*.pt'), ('All files', '*.*')])
-        if found:
-            self._log_add_file(filepath=found,
-                               label_default=os.path.basename(folder.rstrip('/\\')))
+    logs, labels = [], []
+    print('\n  Add log files or model folders (empty to stop).')
+    idx = 1
+    while True:
+        path = _ask(f'Log {idx} path (file or model folder)' if idx > 1
+                    else 'Log 1 path (file or model folder)', default=None if idx == 1 else '')
+        if path == '' and idx > 1:
+            break
+        if not os.path.exists(path):
+            print(f'  Path not found: {path}')
+            continue
+        lbl = _ask('  Label', default=os.path.basename(os.path.normpath(path)).replace('_', ' '))
+        logs.append(path)
+        labels.append(lbl)
+        idx += 1
+        if not _ask_yn('\n  Add another log?', default=False):
+            break
 
-    def _log_refresh_metrics(self):
-        """Refresh both metric dropdowns from the first loaded log."""
-        valid = [r for r in self._log_rows if r['frame'].winfo_exists()]
-
-        if not valid:
-            self._metric_cb.configure(values=[])
-            self._metric2_cb.configure(values=[])
-            return
-
-        try:
-            log  = load_log(valid[0]['filepath'])
-            opts = expand_metric_names(log)
-            self._metric_map = {display: (k, ch) for display, k, ch in opts}
-            names = list(self._metric_map.keys())
-
-            self._metric_cb.configure(values=names)
-            self._metric2_cb.configure(values=['(none)'] + names)
-
-            if self._metric_var.get() not in self._metric_map:
-                self._metric_cb.set(names[0] if names else '')
-            if self._metric2_var.get() not in self._metric_map:
-                self._metric2_cb.set('(none)')
-        except Exception as e:
-            messagebox.showerror('Metric refresh error', str(e))
-            return
-
-        # Enable / disable second metric depending on number of logs
-        single = (len(valid) == 1)
-        state  = 'readonly' if single else 'disabled'
-        self._metric2_cb.configure(state=state)
-        self._metric2_none_lbl.configure(
-            text='' if single else '(available when only one log is loaded)')
-
-    # ── run log plot ──────────────────────────────────────────────────────────
-
-    def _log_run(self):
-        valid = [r for r in self._log_rows if r['frame'].winfo_exists()]
-        if not valid:
-            messagebox.showwarning('No logs', 'Add at least one log file.'); return
-
-        if not self._metric_var.get():
-            messagebox.showwarning('No metric', 'Select a metric to plot.'); return
-
-        if not hasattr(self, '_metric_map'):
-            self._log_refresh_metrics()
-
-        m1_display = self._metric_var.get()
-        m2_display = self._metric2_var.get()
-        if m1_display not in self._metric_map:
-            messagebox.showerror('Error', f'Unknown metric: {m1_display}'); return
-
-        m1_key, m1_ch = self._metric_map[m1_display]
-        m2_key, m2_ch = None, None
-        use_twin = (len(valid) == 1
-                    and m2_display
-                    and m2_display != '(none)'
-                    and m2_display in self._metric_map)
-        if use_twin:
-            m2_key, m2_ch = self._metric_map[m2_display]
-
-        try:
-            window = int(self._ma_var.get())
-        except ValueError:
-            window = 10
-
-        # ── load all logs ─────────────────────────────────────────────────────
-        entries = []
-        for row in valid:
-            label = row['label_var'].get().strip()
-            try:
-                log = load_log(row['filepath'])
-            except Exception as e:
-                messagebox.showerror('Load error', f'{label}:\n{e}'); continue
-            entries.append(dict(label=label, log=log))
-
-        if not entries:
-            return
-
-        save_path = self._log_save.get().strip() or None
-
-        if use_twin:
-            # single log, two metrics, twin y-axes
-            _plot_dual_metric(entries[0], m1_key, m1_ch, m2_key, m2_ch,
-                              window=window, save_path=save_path,
-                              show=self._log_show.get())
+    # show available metrics from first log
+    print('\n  Loading first log to show available metrics…')
+    try:
+        fp = logs[0]
+        if os.path.isdir(fp):
+            for cand in [os.path.join(fp, 'data', 'stage2_all_epochs_raw.pt'),
+                         os.path.join(fp, 'stage2_all_epochs_raw.pt')]:
+                if os.path.exists(cand):
+                    fp = cand; break
+        log0 = load_log(fp)
+        print('\n  Available metrics:')
+        metric_list = []
+        for k in LOG_SCALAR_KEYS:
+            if k in log0:
+                metric_list.append(k)
+                print(f'    {len(metric_list):2d})  {k}')
+        for k in LOG_PER_CH_KEYS:
+            if k in log0:
+                for ch in sorted(log0[k].keys()):
+                    key_str = f'{k}:{ch}'
+                    metric_list.append(key_str)
+                    print(f'    {len(metric_list):2d})  {key_str}')
+        print()
+        choice = _ask('Metric number or key', default='worst_BER')
+        if choice.isdigit() and 1 <= int(choice) <= len(metric_list):
+            metric = metric_list[int(choice) - 1]
         else:
-            # multiple logs, one metric
-            plot_log_comparison(entries, m1_key, m1_ch,
-                                window=window, save_path=save_path,
-                                show=self._log_show.get())
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # TAB 3 — Variation Comparison
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _build_var_tab(self, parent):
-        pad = dict(padx=8, pady=4)
-
-        # ── main folder selector ──────────────────────────────────────────────
-        lf_folder = ctk.CTkFrame(parent)
-        lf_folder.grid(row=0, column=0, columnspan=2, sticky='ew', **pad)
-        ctk.CTkLabel(lf_folder, text='Main model folder', font=ctk.CTkFont(size=12, weight='bold')).grid(
-            row=0, column=0, columnspan=4, padx=8, pady=(6,2), sticky='w')
-        lf_folder.columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(lf_folder, text='Folder:').grid(row=1, column=0, sticky='w', **pad)
-        self._var_folder_var = tk.StringVar()
-        self._var_folder_entry = ctk.CTkEntry(lf_folder, textvariable=self._var_folder_var,
-                                              width=400, state='readonly')
-        self._var_folder_entry.grid(row=1, column=1, sticky='ew', **pad)
-        ctk.CTkButton(lf_folder, text='Browse…', width=80,
-                      command=self._var_browse).grid(row=1, column=2, **pad)
-        ctk.CTkButton(lf_folder, text='⟳  Scan', width=80,
-                      command=self._var_scan).grid(row=1, column=3, **pad)
-
-        ctk.CTkLabel(lf_folder, text='Main model label:').grid(row=2, column=0, sticky='w', **pad)
-        self._var_main_label = tk.StringVar(value='main model')
-        ctk.CTkEntry(lf_folder, textvariable=self._var_main_label,
-                     width=300).grid(row=2, column=1, sticky='w', **pad)
-
-        # ── sub-folder checklist ──────────────────────────────────────────────
-        lf_sf = ctk.CTkFrame(parent)
-        lf_sf.grid(row=1, column=0, columnspan=2, sticky='nsew', **pad)
-        ctk.CTkLabel(lf_sf, text='Sub-folders  (select which to include)',
-                     font=ctk.CTkFont(size=12, weight='bold')).pack(anchor='w', padx=8, pady=(6,2))
-
-        self._sf_inner = ctk.CTkScrollableFrame(lf_sf, height=160)
-        self._sf_inner.pack(fill='both', expand=True, padx=4, pady=4)
-        self._sf_entries: list[dict] = []
-
-        sf_btn_row = ctk.CTkFrame(lf_sf, fg_color='transparent')
-        sf_btn_row.pack(fill='x', pady=(2, 0))
-        ctk.CTkButton(sf_btn_row, text='Select all', width=100,
-                      command=self._var_sf_select_all).pack(side='left', padx=4)
-        ctk.CTkButton(sf_btn_row, text='Select none', width=100,
-                      command=self._var_sf_select_none).pack(side='left', padx=4)
-
-        # ── SNR range ─────────────────────────────────────────────────────────
-        lf_snr = ctk.CTkFrame(parent)
-        lf_snr.grid(row=2, column=0, sticky='nsew', **pad)
-        ctk.CTkLabel(lf_snr, text='SNR range  (integer steps of 1)',
-                     font=ctk.CTkFont(size=12, weight='bold')).grid(
-            row=0, column=0, columnspan=2, padx=8, pady=(6,2))
-
-        def _srow(label, default, r):
-            ctk.CTkLabel(lf_snr, text=label, anchor='w').grid(row=r, column=0, sticky='w', **pad)
-            v = tk.StringVar(value=default)
-            ctk.CTkEntry(lf_snr, textvariable=v, width=80).grid(row=r, column=1, **pad)
-            return v
-
-        self._var_snr_min  = _srow('SNR min (dB)',  '-20', 1)
-        self._var_snr_max  = _srow('SNR max (dB)',  '40',  2)
-        self._var_snr_step = _srow('SNR step (dB)', '1',   3)
-
-        # ── output ────────────────────────────────────────────────────────────
-        lf_out = ctk.CTkFrame(parent)
-        lf_out.grid(row=2, column=1, sticky='nsew', **pad)
-        ctk.CTkLabel(lf_out, text='Output', font=ctk.CTkFont(size=12, weight='bold')).grid(
-            row=0, column=0, columnspan=3, padx=8, pady=(6,2))
-        ctk.CTkLabel(lf_out, text='Save plot to (optional)', anchor='w').grid(
-            row=1, column=0, sticky='w', **pad)
-        self._var_save = tk.StringVar()
-        ctk.CTkEntry(lf_out, textvariable=self._var_save, width=220).grid(row=1, column=1, **pad)
-        ctk.CTkButton(lf_out, text='Browse…', width=80,
-                      command=lambda: self._browse_save(self._var_save)).grid(row=1, column=2, **pad)
-        self._var_show = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(lf_out, text='Show plot interactively',
-                        variable=self._var_show, onvalue=True, offvalue=False).grid(
-            row=2, column=0, columnspan=3, sticky='w', **pad)
-
-        # ── run buttons ───────────────────────────────────────────────────────
-        btn_frame = ctk.CTkFrame(parent, fg_color='transparent')
-        btn_frame.grid(row=3, column=0, columnspan=2, sticky='ew', padx=8, pady=8)
-        btn_frame.columnconfigure(0, weight=1)
-        btn_frame.columnconfigure(1, weight=1)
-
-        ctk.CTkButton(btn_frame, text='▶  Plot all models',
-                      font=ctk.CTkFont(size=13, weight='bold'),
-                      fg_color='#27AE60', hover_color='#1e8449',
-                      command=self._var_run_all).grid(row=0, column=0, sticky='ew', padx=(0, 4))
-        ctk.CTkButton(btn_frame, text='▶  Plot BER envelope',
-                      font=ctk.CTkFont(size=13, weight='bold'),
-                      fg_color='#2E86AB', hover_color='#1a5f7a',
-                      command=self._var_run_envelope).grid(row=0, column=1, sticky='ew', padx=(4, 0))
-
-        parent.columnconfigure(0, weight=1)
-        parent.columnconfigure(1, weight=1)
-        parent.rowconfigure(1, weight=1)
-
-    # ── variation helpers ─────────────────────────────────────────────────────
-
-    def _var_browse(self):
-        path = filedialog.askdirectory(title='Select main model folder')
-        if path:
-            self._var_folder_entry.configure(state='normal')
-            self._var_folder_var.set(path)
-            self._var_folder_entry.configure(state='readonly')
-            self._var_scan()
-
-    def _var_scan(self):
-        """Scan main folder and populate the sub-folder checklist."""
-        folder = self._var_folder_var.get().strip()
-        if not folder:
-            messagebox.showwarning('No folder', 'Please select a main model folder first.')
-            return
-        # auto-fill the main model label with the folder name (user can override)
-        self._var_main_label.set(os.path.basename(folder.rstrip('/\\')))
-
-        for w in self._sf_inner.winfo_children():
-            w.destroy()
-        self._sf_entries.clear()
-
-        # auto-set SNR min from the main model's data folder (always, even if no subfolders)
-        max_snr = read_max_snr_stage1(folder)
-        if max_snr is not None:
-            self._var_snr_min.set(str(int(round(max_snr - 10))))
-            print(f'  Auto SNR min set to {int(round(max_snr - 10))} dB '
-                  f'(max_snr_train_stage_1={max_snr:.1f} - 10)')
-
-        subfolders = discover_subfolders(folder)
-        if not subfolders:
-            ctk.CTkLabel(self._sf_inner,
-                         text='No sub-folders with valid models found.\n'
-                              'Expected: <main>/<sub_folder>/<model>/outputs/{SNR.pt, worst_BER.pt}',
-                         text_color='gray', justify='left').pack(anchor='w', padx=8, pady=8)
-            return
-
-        for sf_name in subfolders:
-            frame = ctk.CTkFrame(self._sf_inner, fg_color='transparent')
-            frame.pack(fill='x', pady=1, padx=4)
-            enabled_var = tk.BooleanVar(value=True)
-            ctk.CTkCheckBox(frame, text='', variable=enabled_var,
-                            onvalue=True, offvalue=False, width=30).grid(row=0, column=0)
-            display_var = tk.StringVar(value=sf_name)
-            ctk.CTkEntry(frame, textvariable=display_var, width=300).grid(row=0, column=1, padx=4, sticky='w')
-            ctk.CTkLabel(frame, text=sf_name, text_color='gray',
-                         font=ctk.CTkFont(size=10)).grid(row=0, column=2, padx=(2, 8), sticky='w')
-            self._sf_entries.append({'name': sf_name, 'display_var': display_var,
-                                     'enabled_var': enabled_var, 'frame': frame})
-
-        print(f'Found {len(subfolders)} sub-folder(s).')
-
-    def _var_sf_select_all(self):
-        for e in self._sf_entries:
-            e['enabled_var'].set(True)
-
-    def _var_sf_select_none(self):
-        for e in self._sf_entries:
-            e['enabled_var'].set(False)
-
-    def _var_get_snr_and_active_sf(self):
-        """Shared validation: returns (snr_targets, active_sf_names) or (None, None)."""
-        try:
-            snr_min  = float(self._var_snr_min.get())
-            snr_max  = float(self._var_snr_max.get())
-            snr_step = float(self._var_snr_step.get())
-        except ValueError as e:
-            messagebox.showerror('Invalid SNR', str(e))
-            return None, None
-
-        if snr_min >= snr_max:
-            messagebox.showerror('Invalid SNR', 'SNR min must be less than SNR max.')
-            return None, None
-        if snr_step <= 0:
-            messagebox.showerror('Invalid SNR', 'SNR step must be positive.')
-            return None, None
-
-        active_sf = [(e['name'], e['display_var'].get().strip() or e['name'])
-                     for e in self._sf_entries
-                     if e['frame'].winfo_exists() and e['enabled_var'].get()]
-        if not active_sf:
-            messagebox.showwarning('Nothing selected', 'Please select at least one sub-folder.')
-            return None, None
-
-        return np.arange(snr_min, snr_max + snr_step * 0.5, snr_step), active_sf
-
-    def _var_load_main_ber(self, snr_targets):
-        """
-        Load stage-3 and stage-1 worst BER from <main_folder>/outputs/.
-        Files expected:
-            SNR.pt
-            worst_BER_stage_3.pt   — shape [N_snr] or [N_channels, N_snr]
-            worst_BER_stage_1.pt   — same shape (optional)
-        Returns a list of dicts (one per stage found), each:
-            {'label', 'snr': np.ndarray, 'ber': np.ndarray}
-        Returns empty list if the outputs folder / SNR file is missing.
-        """
-        folder = self._var_folder_var.get().strip()
-        out    = os.path.join(folder, 'outputs')
-        snr_f  = os.path.join(out, 'SNR.pt')
-        base_label = self._var_main_label.get().strip() or os.path.basename(folder.rstrip('/\\'))
-
-        print(f'  Looking for main model outputs in: {out}')
-
-        if not os.path.isfile(snr_f):
-            messagebox.showinfo('Main model',
-                                f'SNR.pt not found at:\n{snr_f}\n\n'
-                                'Main model will not be plotted.')
-            return []
-
-        try:
-            snr_raw = torch.load(snr_f, weights_only=True)
-            snr_np  = (snr_raw.numpy() if torch.is_tensor(snr_raw)
-                       else np.array(snr_raw)).flatten()
-        except Exception as ex:
-            messagebox.showwarning('Main model SNR load error', str(ex))
-            return []
-
-        def _load_stage_ber(stage):
-            ber_f = os.path.join(out, f'worst_BER_stage_{stage}.pt')
-            print(f'    worst_BER_stage_{stage}.pt exists: {os.path.isfile(ber_f)}')
-            if not os.path.isfile(ber_f):
-                return None
-            try:
-                ber_raw = torch.load(ber_f, weights_only=True)
-                ber_np  = (ber_raw.numpy() if torch.is_tensor(ber_raw)
-                           else np.array(ber_raw))
-                if ber_np.ndim == 2:
-                    ber_np = ber_np.max(axis=0)
-                ber_np = ber_np.flatten()
-
-                matched_snr, matched_ber = [], []
-                for t in snr_targets:
-                    idx = int(np.argmin(np.abs(snr_np - t)))
-                    matched_snr.append(snr_np[idx])
-                    matched_ber.append(ber_np[idx])
-                snr_m = np.array(matched_snr)
-                ber_m = np.array(matched_ber)
-                print(f'  Main stage {stage} loaded. BER range: {ber_m.min():.2e}–{ber_m.max():.2e}')
-                return {'label': f'{base_label}  (main stage {stage})',
-                        'snr': snr_m, 'ber': ber_m}
-            except Exception as ex:
-                print(f'  Warning: could not load stage {stage} BER: {ex}')
-                return None
-
-        results = []
-        for stage in (3, 1):
-            entry = _load_stage_ber(stage)
-            if entry is not None:
-                results.append(entry)
-
-        if not results:
-            messagebox.showinfo('Main model',
-                                f'No worst_BER_stage_*.pt files found in:\n{out}\n\n'
-                                'Main model will not be plotted.')
-        return results
-
-    def _var_run_all(self):
-        """Plot every individual model curve."""
-        snr_targets, active_sf = self._var_get_snr_and_active_sf()
-        if snr_targets is None:
-            return
-
-        folder   = self._var_folder_var.get().strip()
-        sf_names = [name for name, _ in active_sf]
-        sf_labels = {name: lbl for name, lbl in active_sf}
-        models = discover_models_in_subfolders(folder, sf_names)
-        if not models:
-            messagebox.showinfo('No models', 'No valid models found in selected sub-folders.')
-            return
-
-        results, errors = [], []
-        for m in models:
-            # replace the sf_name part of the label with the user's display label
-            sf_part   = m['label'].split(' / ')[0]
-            model_part = m['label'].split(' / ', 1)[1] if ' / ' in m['label'] else m['label']
-            display_label = f"{sf_labels.get(sf_part, sf_part)} / {model_part}"
-            try:
-                snr_m, ber_m = load_variation_ber(m['outputs_path'], snr_targets)
-                results.append({'label': display_label, 'snr': snr_m, 'ber': ber_m})
-            except Exception as ex:
-                errors.append(f"{display_label}:\n  {ex}")
-
-        if errors:
-            messagebox.showwarning('Load warnings',
-                                   'Some models could not be loaded:\n\n' + '\n\n'.join(errors))
-        if not results:
-            messagebox.showinfo('Done', 'No models loaded successfully.')
-            return
-
-        save_path = self._var_save.get().strip() or None
-        main_bers = self._var_load_main_ber(snr_targets)
-        plot_variation_all(results, main_bers=main_bers, save_path=save_path, show=self._var_show.get())
-
-    def _var_run_envelope(self):
-        """For each sub-folder plot the worst/best BER envelope with filled area."""
-        snr_targets, active_sf = self._var_get_snr_and_active_sf()
-        if snr_targets is None:
-            return
-
-        folder = self._var_folder_var.get().strip()
-        folder_results, errors = [], []
-
-        for sf_name, sf_display in active_sf:
-            models = discover_models_in_subfolders(folder, [sf_name])
-            if not models:
-                errors.append(f'{sf_name}: no valid models found')
-                continue
-
-            ber_rows = []
-            for m in models:
-                try:
-                    _, ber_m = load_variation_ber(m['outputs_path'], snr_targets)
-                    ber_rows.append(ber_m)
-                except Exception as ex:
-                    errors.append(f"{m['label']}:\n  {ex}")
-
-            if not ber_rows:
-                continue
-
-            ber_mat = np.vstack(ber_rows)          # [N_models, N_snr]
-            snr_rep, _ = load_variation_ber(models[0]['outputs_path'], snr_targets)
-
-            folder_results.append({
-                'label':   sf_display,
-                'snr':     snr_rep,
-                'ber_mat': ber_mat,
-            })
-            print(f'  {sf_display} ({sf_name}): {len(ber_rows)} model(s) loaded')
-
-        if errors:
-            messagebox.showwarning('Load warnings',
-                                   'Some models could not be loaded:\n\n' + '\n\n'.join(errors))
-        if not folder_results:
-            messagebox.showinfo('Done', 'No data to plot.')
-            return
-
-        save_path = self._var_save.get().strip() or None
-        main_bers = self._var_load_main_ber(snr_targets)
-        plot_variation_envelope(folder_results, main_bers=main_bers, save_path=save_path, show=self._var_show.get())
-
-            # ── shared helpers ────────────────────────────────────────────────────────
-
-    def _browse_save(self, var):
-        p = filedialog.asksaveasfilename(
-            defaultextension='.png',
-            filetypes=[('PNG image', '*.png'), ('PDF', '*.pdf'), ('All files', '*.*')],
-            title='Save plot as…')
-        if p:
-            var.set(p)
-
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # TAB 4 — Architecture & Constellation
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _build_arch_tab(self, parent):
-        pad = dict(padx=8, pady=4)
-
-        # ── model selector ────────────────────────────────────────────────────
-        lf_model = ctk.CTkFrame(parent)
-        lf_model.grid(row=0, column=0, columnspan=2, sticky='ew', **pad)
-        ctk.CTkLabel(lf_model, text='Model', font=ctk.CTkFont(size=12, weight='bold')).grid(
-            row=0, column=0, columnspan=3, padx=8, pady=(6,2), sticky='w')
-        lf_model.columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(lf_model, text='Folder:').grid(row=1, column=0, sticky='w', **pad)
-        self._arch_folder_var = tk.StringVar()
-        self._arch_folder_entry = ctk.CTkEntry(lf_model, textvariable=self._arch_folder_var,
-                                               width=400, state='readonly')
-        self._arch_folder_entry.grid(row=1, column=1, sticky='ew', **pad)
-        ctk.CTkButton(lf_model, text='Browse…', width=80,
-                      command=self._arch_browse).grid(row=1, column=2, **pad)
-
-        ctk.CTkLabel(lf_model, text='Stage:').grid(row=2, column=0, sticky='w', **pad)
-        self._arch_stage_var = tk.IntVar(value=3)
-        sf = ctk.CTkFrame(lf_model, fg_color='transparent')
-        sf.grid(row=2, column=1, sticky='w')
-        for s in (1, 2, 3):
-            ctk.CTkRadioButton(sf, text=str(s), variable=self._arch_stage_var,
-                               value=s).pack(side='left', padx=4)
-
-        # ── constellation settings ────────────────────────────────────────────
-        lf_const = ctk.CTkFrame(parent)
-        lf_const.grid(row=1, column=0, sticky='nsew', **pad)
-        ctk.CTkLabel(lf_const, text='Constellation settings',
-                     font=ctk.CTkFont(size=12, weight='bold')).grid(
-            row=0, column=0, columnspan=2, padx=8, pady=(6,2))
-
-        def _erow(lf, label, default, r):
-            ctk.CTkLabel(lf, text=label, anchor='w').grid(row=r, column=0, sticky='w', **pad)
-            v = tk.StringVar(value=default)
-            ctk.CTkEntry(lf, textvariable=v, width=80).grid(row=r, column=1, **pad)
-            return v
-
-        self._arch_snr = _erow(lf_const, 'SNR (dB)',              '10', 1)
-        self._arch_itr = _erow(lf_const, 'Noise avg iterations',  '1',  2)
-
-        # ── output ────────────────────────────────────────────────────────────
-        lf_out = ctk.CTkFrame(parent)
-        lf_out.grid(row=1, column=1, sticky='nsew', **pad)
-        ctk.CTkLabel(lf_out, text='Output', font=ctk.CTkFont(size=12, weight='bold')).grid(
-            row=0, column=0, columnspan=3, padx=8, pady=(6,2))
-        ctk.CTkLabel(lf_out, text='Save plot to (optional)', anchor='w').grid(
-            row=1, column=0, sticky='w', **pad)
-        self._arch_save = tk.StringVar()
-        ctk.CTkEntry(lf_out, textvariable=self._arch_save, width=220).grid(row=1, column=1, **pad)
-        ctk.CTkButton(lf_out, text='Browse…', width=80,
-                      command=lambda: self._browse_save(self._arch_save)).grid(row=1, column=2, **pad)
-        self._arch_show = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(lf_out, text='Show plot interactively',
-                        variable=self._arch_show, onvalue=True, offvalue=False).grid(
-            row=2, column=0, columnspan=3, sticky='w', **pad)
-
-        # ── run buttons ───────────────────────────────────────────────────────
-        btn_frame = ctk.CTkFrame(parent, fg_color='transparent')
-        btn_frame.grid(row=2, column=0, columnspan=2, sticky='ew', padx=8, pady=8)
-        btn_frame.columnconfigure(0, weight=1)
-        btn_frame.columnconfigure(1, weight=1)
-
-        ctk.CTkButton(btn_frame, text='▶  Plot Architecture',
-                      font=ctk.CTkFont(size=13, weight='bold'),
-                      fg_color='#8E44AD', hover_color='#6c3483',
-                      command=self._arch_run_topology).grid(row=0, column=0, sticky='ew', padx=(0, 4))
-        ctk.CTkButton(btn_frame, text='▶  Plot Constellation',
-                      font=ctk.CTkFont(size=13, weight='bold'),
-                      fg_color='#E67E22', hover_color='#b9600e',
-                      command=self._arch_run_constellation).grid(row=0, column=1, sticky='ew', padx=(4, 0))
-
-        parent.columnconfigure(0, weight=1)
-        parent.columnconfigure(1, weight=1)
-
-    # ── arch helpers ──────────────────────────────────────────────────────────
-
-    def _arch_browse(self):
-        path = filedialog.askdirectory(title='Select model folder')
-        if path:
-            self._arch_folder_entry.configure(state='normal')
-            self._arch_folder_var.set(path)
-            self._arch_folder_entry.configure(state='readonly')
-
-    def _arch_load(self):
-        path = self._arch_folder_var.get().strip()
-        if not path:
-            messagebox.showwarning('No folder', 'Please select a model folder.')
-            return None
-        stage = self._arch_stage_var.get()
-        try:
-            model = load_model(path, stage)
-            return model
-        except Exception as e:
-            messagebox.showerror('Load error', f'Failed to load model:\n{e}')
-            return None
-
-    def _arch_run_topology(self):
-        model = self._arch_load()
-        if model is None:
-            return
-        folder = self._arch_folder_var.get().strip()
-        save_path = self._arch_save.get().strip() or None
-        plot_architecture(model, folder_path=folder, save_path=save_path, show=self._arch_show.get())
-
-    def _arch_run_constellation(self):
-        model = self._arch_load()
-        if model is None:
-            return
-        try:
-            snr_db = float(self._arch_snr.get())
-            n_itr  = int(self._arch_itr.get())
-        except ValueError as e:
-            messagebox.showerror('Invalid setting', str(e))
-            return
-        save_path = self._arch_save.get().strip() or None
-        plot_constellation(model, snr_db=snr_db, n_itr=n_itr,
-                           save_path=save_path, show=self._arch_show.get())
+            metric = choice
+    except Exception as e:
+        print(f'  Could not read metrics: {e}')
+        metric = _ask('Metric key', default='worst_BER')
+
+    window = int(_ask_default('Moving-average window', 10))
+    save   = _ask_save()
+
+    class A: pass
+    args = A()
+    args.log    = logs
+    args.label  = labels
+    args.metric = metric
+    args.list_metrics = False
+    args.window = window
+    args.save   = save
+    cmd_log(args)
+
+
+def wizard_variation():
+    _separator()
+    print('  VARIATION COMPARISON')
+    print('  Compare BER across variation sub-folders of a main model.')
+    _separator()
+
+    main_folder = _ask_path('\n  Main model folder')
+    main_label  = _ask('  Main model legend label',
+                       default=os.path.basename(os.path.normpath(main_folder)))
+
+    # discover sub-folders
+    sf_all = discover_subfolders(main_folder)
+    selected_sf = []
+    sf_labels   = {}
+
+    if sf_all:
+        print(f'\n  Found {len(sf_all)} sub-folder(s):')
+        for i, sf in enumerate(sf_all, 1):
+            print(f'    {i:2d})  {sf}')
+        print()
+        if _ask_yn('  Include all sub-folders?', default=True):
+            selected_sf = sf_all[:]
+        else:
+            for sf in sf_all:
+                if _ask_yn(f'    Include "{sf}"?', default=True):
+                    selected_sf.append(sf)
+
+        print()
+        if _ask_yn('  Customise legend labels for sub-folders?', default=False):
+            for sf in selected_sf:
+                lbl = _ask(f'    Label for "{sf}"', default=sf)
+                if lbl != sf:
+                    sf_labels[sf] = lbl
+    else:
+        print('  No sub-folders auto-discovered.')
+        raw = _ask('  Enter sub-folder names manually (space-separated)')
+        selected_sf = raw.split()
+
+    # SNR range
+    print()
+    snr_min_auto = read_max_snr_stage1(main_folder)
+    snr_min_default = int(round(snr_min_auto - 10)) if snr_min_auto else -20
+    snr_min  = float(_ask_default('SNR min (dB)', snr_min_default))
+    snr_max  = float(_ask_default('SNR max (dB)', 40))
+    snr_step = float(_ask_default('SNR step (dB)', 1))
+
+    mode = 'envelope'
+    if _ask_yn('  Plot mode — envelope (best/worst band)? [Y=envelope / n=all curves]',
+               default=True):
+        mode = 'envelope'
+    else:
+        mode = 'all'
+
+    save = _ask_save()
+
+    class A: pass
+    args = A()
+    args.main        = main_folder
+    args.main_label  = main_label
+    args.subfolders  = selected_sf or None
+    args.sf_labels   = [f'{k}={v}' for k, v in sf_labels.items()] or None
+    args.snr_min     = snr_min
+    args.snr_max     = snr_max
+    args.snr_step    = snr_step
+    args.mode        = mode
+    args.save        = save
+    cmd_variation(args)
+
+
+def wizard_arch():
+    _separator()
+    print('  ARCHITECTURE')
+    print('  Plot the spatial relay network diagram.')
+    _separator()
+
+    model_path = _ask_path('\n  Model folder')
+    stage      = int(_ask_default('Stage', 3))
+    save       = _ask_save()
+
+    class A: pass
+    args = A()
+    args.model = model_path
+    args.stage = stage
+    args.save  = save
+    cmd_arch(args)
+
+
+def wizard_const():
+    _separator()
+    print('  CONSTELLATION')
+    print('  Plot TX symbol constellation and received symbol clouds.')
+    _separator()
+
+    model_path = _ask_path('\n  Model folder')
+    stage      = int(_ask_default('Stage', 3))
+    snr        = float(_ask_default('SNR (dB)', 10))
+    itr        = int(_ask_default('Noise averaging iterations (1 = clean plot)', 1))
+    save       = _ask_save()
+
+    class A: pass
+    args = A()
+    args.model = model_path
+    args.stage = stage
+    args.snr   = snr
+    args.itr   = itr
+    args.save  = save
+    cmd_const(args)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Entry point
+# Main menu
 # ─────────────────────────────────────────────────────────────────────────────
+
+TABS = [
+    ('BER Comparison',             wizard_ber),
+    ('Log Comparison',             wizard_log),
+    ('Variation Comparison',       wizard_variation),
+    ('Architecture',               wizard_arch),
+    ('Constellation',              wizard_const),
+]
+
+
+def main():
+    # If called with CLI args (e.g. from a script), fall through to argparse
+    if len(sys.argv) > 1:
+        _main_argparse()
+        return
+
+    # Interactive menu
+    while True:
+        print('\n' + '═' * 60)
+        print('  MODEL COMPARISON TOOL')
+        print('═' * 60)
+        for i, (name, _) in enumerate(TABS, 1):
+            print(f'  {i})  {name}')
+        print('  q)  Quit')
+        print('─' * 60)
+
+        try:
+            choice = input('  Select tab: ').strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print('\nBye.')
+            break
+
+        if choice == 'q':
+            print('Bye.')
+            break
+
+        if choice.isdigit() and 1 <= int(choice) <= len(TABS):
+            _, wizard = TABS[int(choice) - 1]
+            try:
+                wizard()
+            except KeyboardInterrupt:
+                print('\n  (cancelled — back to menu)')
+            except Exception as e:
+                print(f'\n  ERROR: {e}')
+                import traceback; traceback.print_exc()
+            input('\n  Press Enter to return to menu…')
+        else:
+            print('  Invalid choice.')
+
+
+def _main_argparse():
+    """Legacy argparse interface — use  python compare_models.py <cmd> --help."""
+    p = argparse.ArgumentParser(
+        prog='compare_models.py',
+        description='Run without arguments for interactive mode.')
+    sub = p.add_subparsers(dest='cmd', required=True)
+
+    pb = sub.add_parser('ber')
+    pb.add_argument('--model',    action='append', required=True)
+    pb.add_argument('--stage',    type=int, action='append')
+    pb.add_argument('--label',    action='append')
+    pb.add_argument('--snr-min',  type=float, default=None)
+    pb.add_argument('--snr-max',  type=float, default=40.0)
+    pb.add_argument('--snr-step', type=float, default=1.0)
+    pb.add_argument('--batch',    type=int,   default=1000)
+    pb.add_argument('--itr',      type=int,   default=10)
+    pb.add_argument('--save',     default=None)
+
+    pl = sub.add_parser('log')
+    pl.add_argument('--log',          action='append', required=True)
+    pl.add_argument('--label',        action='append')
+    pl.add_argument('--metric',       default='worst_BER')
+    pl.add_argument('--list-metrics', action='store_true')
+    pl.add_argument('--window',       type=int, default=10)
+    pl.add_argument('--save',         default=None)
+
+    pv = sub.add_parser('variation')
+    pv.add_argument('--main',        required=True)
+    pv.add_argument('--main-label',  default=None)
+    pv.add_argument('--subfolders',  nargs='+')
+    pv.add_argument('--sf-labels',   nargs='+')
+    pv.add_argument('--snr-min',     type=float, default=None)
+    pv.add_argument('--snr-max',     type=float, default=40.0)
+    pv.add_argument('--snr-step',    type=float, default=1.0)
+    pv.add_argument('--mode',        choices=['all', 'envelope'], default='envelope')
+    pv.add_argument('--save',        default=None)
+
+    pa = sub.add_parser('arch')
+    pa.add_argument('--model', required=True)
+    pa.add_argument('--stage', type=int, default=3)
+    pa.add_argument('--save',  default=None)
+
+    pc = sub.add_parser('const')
+    pc.add_argument('--model', required=True)
+    pc.add_argument('--stage', type=int, default=3)
+    pc.add_argument('--snr',   type=float, default=10.0)
+    pc.add_argument('--itr',   type=int,   default=1)
+    pc.add_argument('--save',  default=None)
+
+    args = p.parse_args()
+    dispatch = {'ber': cmd_ber, 'log': cmd_log, 'variation': cmd_variation,
+                'arch': cmd_arch, 'const': cmd_const}
+    dispatch[args.cmd](args)
+
 
 if __name__ == '__main__':
-    app = App()
-    app.mainloop()
+    main()

@@ -22,11 +22,30 @@ device = (
 )
 torch.manual_seed(0)
 orignal_Name_of_model = "compare_networks"
-N_networks = 2
+N_networks = 50
 SNR_basic_trainning = 50
 max_iteration = 2
 SNR_step = 5
 BER_th = 1e-3
+
+
+def count_existing_random_selections(main_path, n_channels):
+    """Count how many random_selections subfolders already contain a finished stage_3 model."""
+    random_sel_path = os.path.join(main_path, "random_selections")
+    if not os.path.exists(random_sel_path):
+        return 0
+
+    count = 0
+    for name in os.listdir(random_sel_path):
+        sub_path = os.path.join(random_sel_path, name)
+        if not os.path.isdir(sub_path):
+            continue
+        python_models_path = os.path.join(sub_path, "models", "python")
+        # Check that all channels were saved for this selection
+        if all(os.path.exists(os.path.join(python_models_path, f"stage_3c{c}"))
+               for c in range(n_channels)):
+            count += 1
+    return count
 
 
 for idx in range(10):
@@ -34,11 +53,16 @@ for idx in range(10):
 
     main_path = os.path.join(".", Name_of_model, "")
 
-    model = load_model(path=main_path,stage=1)
+    model = load_model(path=main_path, stage=1)
     max_snr_train = torch.load(os.path.join(main_path, "data", "max_snr_train_stage_1"), weights_only=True)
     if not os.path.exists(os.path.join(".", Name_of_model, "random_selections")):
         os.makedirs(os.path.join(".", Name_of_model, "random_selections"))
-    for t in tqdm(range(N_networks)):
+
+    n_existing = count_existing_random_selections(main_path, model.N_channels)
+    n_to_run = max(0, N_networks - n_existing)
+    print(f"{Name_of_model}: found {n_existing} existing random selections, running {n_to_run} more")
+
+    for t in tqdm(range(n_to_run)):
         start_time_1 = time.time()
 
         model.load(main_path, "stage_1")
@@ -65,6 +89,14 @@ for idx in range(10):
         print(f"Selected model in {orignal_Name_of_model}-{t}: {name_of_model_random}")
 
         path = os.path.join(main_path, "random_selections", name_of_model_random, "")
+
+        # Skip if this specific selection already has a finished stage_3 model
+        python_models_path = os.path.join(path, "models", "python")
+        if all(os.path.exists(os.path.join(python_models_path, f"stage_3c{c}"))
+               for c in range(model.N_channels)):
+            print(f"Skipping {name_of_model_random}, already exists")
+            continue
+
         if not os.path.exists(path):
             os.makedirs(path)
             os.makedirs(os.path.join(path, "models"))

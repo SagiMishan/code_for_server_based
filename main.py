@@ -63,7 +63,7 @@ device = (
     if torch.backends.mps.is_available()
     else "cpu"
 )
-for idx in range(10):
+for idx in range(5,10):
     Name_of_model = f"{orignal_Name_of_model}_{idx}"
     if not os.path.exists(os.path.join(Name_of_model)):
         start_from_zero = True
