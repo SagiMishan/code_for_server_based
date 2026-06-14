@@ -24,8 +24,8 @@ torch.manual_seed(0)
 orignal_Name_of_model = "compare_networks"
 N_networks = 50
 SNR_basic_trainning = 50
-max_iteration = 2
-SNR_step = 5
+max_iteration = 5
+SNR_step = 1
 BER_th = 1e-3
 
 

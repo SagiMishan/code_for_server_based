@@ -291,7 +291,7 @@ def plot_blobs(prefix, stage=2, save_path=None):
         loc="upper left", fontsize=9, framealpha=0.8)
     fig1.tight_layout()
     p1 = f"{base}{ext}"
-    fig1.savefig(p1, dpi=150, bbox_inches="tight")
+    fig1.savefig(os.path.join(DEFAULT_PREFIX + "_results", p1), dpi=150, bbox_inches="tight")
     print(f"Figure 1 (blobs) saved → {p1}")
     plt.close(fig1)
 
@@ -356,7 +356,7 @@ def plot_blobs(prefix, stage=2, save_path=None):
 
     fig2.tight_layout()
     p2 = f"{base}_density_combined{ext}"
-    fig2.savefig(p2, dpi=150, bbox_inches="tight")
+    fig2.savefig(os.path.join(DEFAULT_PREFIX + "_results", p2), dpi=150, bbox_inches="tight")
     print(f"Figure 2 (combined density) saved → {p2}")
     plt.close(fig2)
 
@@ -420,7 +420,7 @@ def plot_blobs(prefix, stage=2, save_path=None):
 
     fig3.tight_layout()
     p3 = f"{base}_density_split{ext}"
-    fig3.savefig(p3, dpi=150, bbox_inches="tight")
+    fig3.savefig(os.path.join(DEFAULT_PREFIX + "_results", p3), dpi=150, bbox_inches="tight")
     print(f"Figure 3 (split density) saved → {p3}")
     plt.close(fig3)
 
