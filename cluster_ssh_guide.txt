@@ -1,3 +1,39 @@
+
+ssh dml17
+cd ./projects/code_for_server_based/
+source ./.venv/bin/activate
+
+
+
+
+
+
+nohup python random_networks.py > log_files/random_output.log 2>&1 &
+ps aux | grep python
+
+
+
+
+conda activate relay_env
+cd /home/dsi/mishans1/projects/code_for_server_based
+
+# CPU venv
+python -m venv .venv_cpu
+conda deactivate
+source .venv_cpu/bin/activate
+pip install torch torchvision torchaudio matplotlib numpy
+deactivate
+
+# GPU venv
+conda activate gui_env 
+python -m venv .venv_gpu
+conda deactivate
+source .venv_gpu/bin/activate
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install matplotlib numpy scipy tqdm
+deactivate
+
+
 ===============================================================
   BIU DSI CLUSTER — SSH + VENV SETUP GUIDE
 ===============================================================

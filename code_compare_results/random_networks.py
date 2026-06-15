@@ -3,14 +3,14 @@ import sys
 import time
 from tqdm import tqdm
 
-from SmallFunctions import _fmt
+from code_Networks.SmallFunctions import _fmt
 original_stdout = sys.stdout
 
 import matplotlib.pyplot as plt
 
-from Network_multy_channels import Network_multy_channel, load_model
-from Train_funcatios_clude import *
-from SmallFunctions import *
+from code_Networks.Network_multy_channels import Network_multy_channel, load_model
+from code_Networks.Train_funcatios_clude import *
+from code_Networks.SmallFunctions import *
 
 # Get cpu, gpu or mps device for training.
 device = (
