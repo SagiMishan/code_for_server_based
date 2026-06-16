@@ -16,21 +16,25 @@ Each saved .pt file is a dict: {"SNR": tensor[N_snr], "BER": tensor[N_channels, 
 Built on top of Network_multy_channels.load_model / evaluate_model
 (same conventions as compare_models.py).
 """
-import sys
 import os
 import torch
 from tqdm import tqdm
+import sys
+from pathlib import Path
+
+# Add the main folder (parent of A, B, C, etc.) to sys.path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 from code_Networks.Network_multy_channels import Network_multy_channel, load_model, dB2lin
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
-
+BASE_PATH = "/home/dsi/mishans1/projects/code_for_server_based/"
 ORIGINAL_NAME = "compare_networks"
 N_NETWORKS    = 10
 
-SNR_RANGE = torch.linspace(-20, 40, 61)  # SNR points (dB) to evaluate
+SNR_RANGE = torch.linspace(-20, 40, 121)  # SNR points (dB) to evaluate
 BATCH     = 10 ** 6
 NUM_ITR   = 1
 
@@ -108,6 +112,11 @@ def evaluate_and_save_stages(path: str, label: str ,sub_path = None) -> None:
     model.to(DEVICE)
     if sub_path is not None:
         path = sub_path
+        outputs_dir = os.path.join(sub_path, "outputs")
+        os.makedirs(outputs_dir, exist_ok=True)
+    else:
+        outputs_dir = os.path.join(path, "outputs")
+        os.makedirs(outputs_dir, exist_ok=True)
 
     for stage in STAGES:
         if not stage_files_exist(path, stage, model.N_channels):
@@ -131,13 +140,13 @@ original_stdout = sys.stdout
 def main():
     for idx in tqdm(range(N_NETWORKS), desc="Evaluating networks"):
         name_of_model = f"{ORIGINAL_NAME}_{idx}"
-        main_path = os.path.join(".", name_of_model, "")
+        main_path = os.path.join(BASE_PATH, name_of_model, "")
 
         if not os.path.isdir(main_path):
             print(f"{name_of_model}: folder not found, skipping")
             continue
 
-        print(f"\n=== {name_of_model} ===")
+        # print(f"\n=== {name_of_model} ===")
         sys.stdout = open(os.devnull, 'w')
         try:
             # ── main model, all stages ──────────────────────────────────────────
