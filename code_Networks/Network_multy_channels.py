@@ -137,12 +137,23 @@ class Network_multy_channel(nn.Module):
         if stage3:
             self.set_weights()
         for itr in range(num_itr):
-            signal ,bits = self.sub_networks[model_idx].modulator(batch)
+            self.sub_networks[model_idx].SNR = dB2lin(SNR)
+            signal_low ,bits_low = self.sub_networks[model_idx].modulator(batch)
             # Compute prediction error
-            rm = self.sub_networks[model_idx](signal ,bits)
-            pred = self.sub_networks[model_idx].demodulator(rm)
+            rm_low = self.sub_networks[model_idx](signal_low ,bits_low)
+            pred_low = self.sub_networks[model_idx].demodulator(rm_low)
 
-            loss = loss_fn(torch.reshape(pred, (-1,)), torch.reshape(bits.to(torch.int32) * 2 - 1, (-1,)))
+            loss_low = loss_fn(torch.reshape(pred_low, (-1,)), torch.reshape(bits_low.to(torch.int32) * 2 - 1, (-1,)))
+
+
+            self.sub_networks[model_idx].SNR = dB2lin(SNR + 5)
+            signal_high ,bits_high = self.sub_networks[model_idx].modulator(batch)
+            # Compute prediction error
+            rm_high = self.sub_networks[model_idx](signal_high ,bits_high)
+            pred_high = self.sub_networks[model_idx].demodulator(rm_high)
+
+            loss_high = loss_fn(torch.reshape(pred_high, (-1,)), torch.reshape(bits_high.to(torch.int32) * 2 - 1, (-1,)))
+            loss = torch.sqrt(loss_low * loss_high)
             loss.backward()
 
             optimizer.step()
@@ -152,8 +163,8 @@ class Network_multy_channel(nn.Module):
             if itr % 100 == 0:
                 loss = loss.item()
                 runnig_loss[int(itr / 100)] = loss
-                worst_BER, avrage_BER, best_BER = self.sub_networks[model_idx].BER(bits=bits, pred=pred)
-                BER[int(itr / 100)] = worst_BER
+                worst_BER, avrage_BER, best_BER = self.sub_networks[model_idx].BER(bits=bits_low, pred=pred_low)
+                BER[int(itr / 100)] = worst_BER.cpu()
                 print("channel {} -- loss: {:.5f} , BER : {:.5f}".format(model_idx, loss, BER[int(itr / 100)][0]))
         return BER, runnig_loss
 
@@ -192,8 +203,8 @@ class Network_multy_channel(nn.Module):
         score = 0
         C = self.N_channels
         for c in range(self.N_channels):
-            relay_v_sum = relay_v_sum + self.sub_networks[c].V
-            relay_v_max = torch.maximum(relay_v_max, self.sub_networks[c].V)
+            relay_v_sum = relay_v_sum + self.sub_networks[c].V.cpu()
+            relay_v_max = torch.maximum(relay_v_max, self.sub_networks[c].V.cpu())
         relay_v_sum = torch.maximum(relay_v_sum, tensor(1e-6))
         relay_v_max = torch.maximum(relay_v_max, tensor(1e-6))
         score = score + torch.sum(C / (C - 1) * relay_v_max / relay_v_sum - 1 / (C - 1))
@@ -210,7 +221,7 @@ class Network_multy_channel(nn.Module):
         self.update_v()
         # Stack all V tensors into a single [N_channels, N_relays, 1] tensor —
         # sum and assignment become single tensor ops, no Python loops.
-        V_stack = torch.stack([self.sub_networks[c].V for c in range(self.N_channels)], dim=0)  # [C, N, 1]
+        V_stack = torch.stack([self.sub_networks[c].V for c in range(self.N_channels)], dim=0).cpu()  # [C, N, 1]
         relay_v_sum = V_stack.sum(dim=0, keepdim=True).clamp(min=1e-6)  # [1, N, 1]
         P_stack = V_stack / relay_v_sum  # [C, N, 1]
         for c in range(self.N_channels):
@@ -222,7 +233,7 @@ class Network_multy_channel(nn.Module):
         bias_probability = (torch.rand(self.N_relays) <= z0).unsqueeze(0).expand_as(p_r)
 
         # True  → zero out,  False → keep
-        to_zero_out = p_r <= torch.rand(p_r.shape)
+        to_zero_out = p_r.cpu() <= torch.rand(p_r.shape)
         # Always keep the best channel for every relay
         to_zero_out[torch.argmax(p_r, dim=0), torch.arange(p_r.shape[1])] = False
         # Only zero out where both the random draw AND the bias gate say so
@@ -232,7 +243,7 @@ class Network_multy_channel(nn.Module):
         n_dropped = (~keep_mask).sum().item()
         if n_dropped > 0:
             for c in range(self.N_channels):
-                mask = keep_mask[c].unsqueeze(1)  # [N, 1]
+                mask = keep_mask[c].unsqueeze(1).to(self.sub_networks[c].w.data.device)  # [N, 1]
                 self.sub_networks[c].w.data.mul_(mask)
                 self.sub_networks[c].b.data.mul_(mask)
 
@@ -246,7 +257,7 @@ class Network_multy_channel(nn.Module):
         winner[torch.argmax(p_r, dim=0), torch.arange(p_r.shape[1])] = 1.0
 
         for c in range(self.N_channels):
-            mask = winner[c].unsqueeze(1).bool()  # [N, 1]
+            mask = winner[c].unsqueeze(1).bool().to(self.sub_networks[c].w.data.device)  # [N, 1]
 
             self.sub_networks[c].w.data.mul_(mask)
             self.sub_networks[c].b.data.mul_(mask)
@@ -299,9 +310,9 @@ class Network_multy_channel(nn.Module):
             self.sub_networks[c].save_python(path, Name + f"c{c}")
             self.sub_networks[c].save_matlab(path, Name + f"c{c}")
 
-    def load(self, path, Name):
+    def load(self, path, Name,device=None):
         for c in range(self.N_channels):
-            self.sub_networks[c].load(path, Name + f"c{c}")
+            self.sub_networks[c].load(path, Name + f"c{c}", device=device)
 
 
 

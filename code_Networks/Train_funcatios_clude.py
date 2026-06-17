@@ -287,9 +287,7 @@ def train_multy_channel(model, num_itr, loss_fn, optimizer, path, z0,
         bais_probability=[],
     )
 
-    snr_lin = dB2lin(SNR)
-    for c in range(C):
-        model.sub_networks[c].SNR = snr_lin
+ 
 
     all_pred = [None] * C
     all_bits = [None] * C
@@ -301,15 +299,28 @@ def train_multy_channel(model, num_itr, loss_fn, optimizer, path, z0,
 
         for c in range(C):
             model.sub_networks[c].train()
-            signal, bits = model.sub_networks[c].modulator(batch)
-            rm = model.sub_networks[c](signal, bits)
-            pred = model.sub_networks[c].demodulator(rm)
-
-            all_pred[c] = pred.detach()
-            all_bits[c] = bits
-
+            model.sub_networks[c].SNR = dB2lin(SNR)
             sum_v_c = model.sub_networks[c].V.sum()
-            loss = loss + loss_fn(pred, bits * 2 - 1) + 1e-1 * sum_v_c / N
+
+            signal_low, bits_low = model.sub_networks[c].modulator(batch)
+            rm_low = model.sub_networks[c](signal_low, bits_low)
+            pred_low = model.sub_networks[c].demodulator(rm_low)
+
+            all_pred[c] = pred_low.detach()
+            all_bits[c] = bits_low
+
+            loss_low = loss_fn(pred_low, bits_low * 2 - 1)+ 1e-1 * sum_v_c / N
+
+
+            model.sub_networks[c].SNR = dB2lin(SNR + 5)
+            signal_high, bits_high = model.sub_networks[c].modulator(batch)
+            rm_high = model.sub_networks[c](signal_high, bits_high)
+            pred_high = model.sub_networks[c].demodulator(rm_high)
+
+
+            loss_high = loss_fn(pred_high, bits_high * 2 - 1)+ 1e-1 * sum_v_c / N
+            loss = loss + torch.sqrt(loss_low * loss_high)
+
 
         loss.backward()
         # if nan output this code will help to find it
@@ -488,7 +499,7 @@ def stage_1(model, basic_training, SNR_basic_trainning, SNR_max, SNR_step, max_i
         torch.save(max_snr_train, os.path.join(path, "data", "max_snr_train_stage_1"))
         model.save(path, "stage_1")
     else:
-        model.load(path, "stage_1")
+        model.load(path, "stage_1",device=device)
         max_snr_train = torch.load(os.path.join(path, "data", "max_snr_train_stage_1"), weights_only=True)
 
     return max_snr_train

@@ -81,8 +81,8 @@ class Network_single_channel(nn.Module):
         self.V = torch.ones((self.N_relays, 1))
         self.BN = [ComplexBatchNorm1d(num_of_dim=self.HierarchyLayers[i].size(0)) for i in range(1, self.N_layers)]
 
-        self.User_w = nn.Parameter(self.randomComplexNormal((self.N_users , 1), sigma=0.1))
-        self.User_b = nn.Parameter(self.randomComplexNormal((self.N_users , 1), sigma=0.1))
+        self.User_w = nn.Parameter(self.randomComplexNormal((self.N_users* self.N_rx , 1), sigma=0.1))
+        self.User_b = nn.Parameter(self.randomComplexNormal((self.N_users* self.N_rx , 1), sigma=0.1))
         self.User_BN = ComplexBatchNorm1d(num_of_dim=self.N_users * self.N_rx)
 
 
@@ -122,7 +122,6 @@ class Network_single_channel(nn.Module):
     def forward(self, s,bits):
         batch_size = bits.shape[1]
         if self.demod_type == "complex":
-
             x = self.transmitNN(bits.to(torch.complex64).T).T
         else:
             x = torch.unsqueeze(s,dim=0)
@@ -146,10 +145,14 @@ class Network_single_channel(nn.Module):
         r = r + self.MatcgTU.T @ x + self.randomComplexNormal(r.shape, 1 / self.SNR)
         # r = self.User_BN(r, self.training).reshape((self.N_users, self.N_rx,batch_size)).sum(dim=1)
         # r = r * self.User_w + self.User_b
-        r = self.User_BN(r, self.training).reshape((self.N_users, self.N_rx,batch_size))
+        r = self.User_BN(r, self.training)
+        r = self.User_w * r + self.User_b
         if self.demod_type == "complex":
+            r = r.reshape((self.N_users, self.N_rx,batch_size))
             r = torch.cat( [self.reciverNN[m](r[m,:,:].T).T for m in range(self.N_users)],dim=0)
-
+        else:
+            r = r * self.User_w + self.User_b
+            r = r.reshape((self.N_users, self.N_rx,batch_size)).sum(dim=1)
         return r
 
     def NetworkHierarchyLayers(self, connectionMatrix):

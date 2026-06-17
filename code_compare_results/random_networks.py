@@ -65,7 +65,7 @@ for idx in range(10):
     for t in tqdm(range(n_to_run)):
         start_time_1 = time.time()
 
-        model.load(main_path, "stage_1")
+        model = load_model(path=main_path)
         for c in range(model.N_channels):
             model.P[c] = torch.rand(model.P[c].shape)
 
@@ -108,7 +108,7 @@ for idx in range(10):
         try:
             stage_3(model=model,
                     SNR_basic_trainning=SNR_basic_trainning,
-                    SNR_max=max_snr_train + 3,
+                    SNR_max=max_snr_train + 5,
                     BER_th=BER_th,
                     device=device,
                     SNR_step=SNR_step,

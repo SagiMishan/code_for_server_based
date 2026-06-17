@@ -14,7 +14,10 @@ where
     g_mn   = cgRU[c][n, m]                         relay n -> user m
     sigma2 = P_source / SNR_lin                    noise variance
 """
-
+import sys
+from pathlib import Path
+# Add the main folder (parent of code_compare_results, etc.) to sys.path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 import os
 import math
 from pathlib import Path
@@ -29,31 +32,18 @@ from code_Networks.SmallFunctions import dB2lin
 # <<< USER SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
 
-Name_of_model = "model_4_comper_results_single_TX_RX_anntenas"
-path          = ".\\" + Name_of_model + "\\"
+Name_of_model = "/home/dsi/mishans1/projects/code_for_server_based/compare_networks"
 
 P_source = 1.0
 P_relay  = 1.0
 
-SNR_dB_vec = torch.arange(-30, 60, 2, dtype=torch.float32)   # -10 … 20 dB
+SNR_dB_vec = torch.arange(-20, 60, 0.5, dtype=torch.float32)   # -10 … 20 dB
 
-N_monte_carlo = 200_000     # bits per user per SNR point for BER estimate
 
 # ─────────────────────────────────────────────────────────────────────────────
 # load channel tensors
 # ─────────────────────────────────────────────────────────────────────────────
 
-MatcgSR          = torch.load(path + "data\\MatcgSR.pt",          weights_only=True)
-cgRU             = torch.load(path + "data\\cgRU.pt",             weights_only=True)
-cgTU             = torch.load(path + "data\\cgTU.pt",             weights_only=True)
-connectaionMatrix= torch.load(path + "data\\connectaionMatrix.pt",weights_only=True)
-N_users          = torch.load(path + "data\\N_users.pt",          weights_only=True)
-N_channels       = int(torch.load(path + "data\\N_channels.pt",   weights_only=True))
-
-N_relays = MatcgSR[0].shape[1]     # inferred from tensor shape
-
-print(f"N_channels={N_channels}  N_relays={N_relays}  "
-      f"N_users={N_users}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # relay selection — per channel, per SNR point
@@ -123,105 +113,119 @@ def direct_link_snr(c: int, sigma2: float) -> torch.Tensor:
 # ─────────────────────────────────────────────────────────────────────────────
 # sweep over SNR vector
 # ─────────────────────────────────────────────────────────────────────────────
+for idx in range(10):
+    path          = os.path.join(".", f"{Name_of_model}_{idx}", "")
 
-S = len(SNR_dB_vec)
+    MatcgSR          = torch.load(os.path.join(os.pardir, path + "data","MatcgSR.pt"),          weights_only=True)
+    cgRU             = torch.load(os.path.join(path + "data","cgRU.pt"),             weights_only=True)
+    cgTU             = torch.load(os.path.join(path + "data","cgTU.pt"),             weights_only=True)
+    connectaionMatrix= torch.load(os.path.join(path + "data","connectaionMatrix.pt"),weights_only=True)
+    N_users          = torch.load(os.path.join(path + "data","N_users.pt"),          weights_only=True)
+    N_channels       = int(torch.load(os.path.join(path + "data","N_channels.pt"),   weights_only=True))
 
-# [N_channels, S]  — worst-user BER per channel per SNR point
-worst_BER      = torch.zeros(N_channels, S)
-# [N_channels, S]  — which relay was chosen
-chosen_relay   = torch.zeros(N_channels, S, dtype=torch.long)
-# [N_channels, S]  — worst-user BER for direct source→user link
-direct_BER     = torch.zeros(N_channels, S)
+    N_relays = MatcgSR[0].shape[1]     # inferred from tensor shape
 
-print(f"\n{'─'*70}")
-print(f"{'SNR(dB)':>8}  {'ch':>3}  {'relay':>6}  "
-      f"{'worst SNR(dB)':>14}  {'worst BER':>10}")
-print(f"{'─'*70}")
+    print(f"N_channels={N_channels}  N_relays={N_relays}  "
+        f"N_users={N_users}")
 
-for si, snr_dB in enumerate(SNR_dB_vec):
-    sigma2 = P_source / dB2lin(float(snr_dB))
+    S = len(SNR_dB_vec)
 
-    for c in range(N_channels):
-        relay, snr_achieved = select_best_relay(c, float(sigma2))
+    # [N_channels, S]  — worst-user BER per channel per SNR point
+    worst_BER      = torch.zeros(N_channels, S)
+    # [N_channels, S]  — which relay was chosen
+    chosen_relay   = torch.zeros(N_channels, S, dtype=torch.long)
+    # [N_channels, S]  — worst-user BER for direct source→user link
+    direct_BER     = torch.zeros(N_channels, S)
 
-        # worst user = the user with the lowest SNR
-        worst_snr_lin  = snr_achieved.min()
-        worst_snr_dB   = 10 * math.log10(max(float(worst_snr_lin), 1e-20))
-        ber            = float(ber_bpsk(worst_snr_lin.unsqueeze(0))[0])
+    print(f"\n{'─'*70}")
+    print(f"{'SNR(dB)':>8}  {'ch':>3}  {'relay':>6}  "
+        f"{'worst SNR(dB)':>14}  {'worst BER':>10}")
+    print(f"{'─'*70}")
 
-        worst_BER[c, si]    = ber
-        chosen_relay[c, si] = relay
+    for si, snr_dB in enumerate(SNR_dB_vec):
+        sigma2 = P_source / dB2lin(float(snr_dB))
 
-        # direct link — worst user SNR then BER
-        d_snr             = direct_link_snr(c, float(sigma2))   # [N_users_c]
-        d_worst_snr       = d_snr.min()
-        d_ber             = float(ber_bpsk(d_worst_snr.unsqueeze(0))[0])
-        direct_BER[c, si] = d_ber
+        for c in range(N_channels):
+            relay, snr_achieved = select_best_relay(c, float(sigma2))
 
-        print(f"{float(snr_dB):>8.1f}  {c:>3}  {relay:>6}  "
-              f"{worst_snr_dB:>14.2f}  {ber:>10.3e}  direct={d_ber:.3e}")
+            # worst user = the user with the lowest SNR
+            worst_snr_lin  = snr_achieved.min()
+            worst_snr_dB   = 10 * math.log10(max(float(worst_snr_lin), 1e-20))
+            ber            = float(ber_bpsk(worst_snr_lin.unsqueeze(0))[0])
 
-# ─────────────────────────────────────────────────────────────────────────────
-# save results — one folder per benchmark, same layout as a trained model
-# ─────────────────────────────────────────────────────────────────────────────
+            worst_BER[c, si]    = ber
+            chosen_relay[c, si] = relay
 
-# worst performing channel across all channels
-overall_worst_BER = worst_BER.max(dim=0).values    # [S]
-direct_worst_BER  = direct_BER.max(dim=0).values   # [S]
-# relay chosen for the worst channel at each SNR point
-worst_ch_relay    = torch.zeros(S, dtype=torch.long)
-for si in range(S):
-    worst_ch = int(worst_BER[:, si].argmax())
-    worst_ch_relay[si] = chosen_relay[worst_ch, si]
+            # direct link — worst user SNR then BER
+            d_snr             = direct_link_snr(c, float(sigma2))   # [N_users_c]
+            d_worst_snr       = d_snr.min()
+            d_ber             = float(ber_bpsk(d_worst_snr.unsqueeze(0))[0])
+            direct_BER[c, si] = d_ber
 
-# ── benchmark relay ───────────────────────────────────────────────────────────
-relay_out = path + "Single relay per channel\\" * 2
-os.makedirs(relay_out + "outputs\\", exist_ok=True)
-torch.save(SNR_dB_vec,         relay_out + "outputs\\SNR.pt")
-torch.save(overall_worst_BER,  relay_out + "outputs\\worst_BER.pt")
-torch.save(worst_ch_relay,     relay_out + "outputs\\relay_chosen.pt")
-print(f"Relay benchmark saved  → {relay_out}outputs\\")
+            print(f"{float(snr_dB):>8.1f}  {c:>3}  {relay:>6}  "
+                f"{worst_snr_dB:>14.2f}  {ber:>10.3e}  direct={d_ber:.3e}")
 
-# ── benchmark direct link ─────────────────────────────────────────────────────
-direct_out = path + "Direct link\\"*2
-os.makedirs(direct_out + "outputs\\", exist_ok=True)
-torch.save(SNR_dB_vec,        direct_out + "outputs\\SNR.pt")
-torch.save(direct_worst_BER,  direct_out + "outputs\\worst_BER.pt")
-print(f"Direct link benchmark saved → {direct_out}outputs\\")
+    # ─────────────────────────────────────────────────────────────────────────────
+    # save results — one folder per benchmark, same layout as a trained model
+    # ─────────────────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BER vs SNR plot — worst channel only, relay=blue, direct=red
-# ─────────────────────────────────────────────────────────────────────────────
+    # worst performing channel across all channels
+    overall_worst_BER = worst_BER.max(dim=0).values    # [S]
+    direct_worst_BER  = direct_BER.max(dim=0).values   # [S]
+    # relay chosen for the worst channel at each SNR point
+    worst_ch_relay    = torch.zeros(S, dtype=torch.long)
+    for si in range(S):
+        worst_ch = int(worst_BER[:, si].argmax())
+        worst_ch_relay[si] = chosen_relay[worst_ch, si]
 
-snr_np = SNR_dB_vec.numpy()
-marks  = ['o', '^', 's', 'D', 'P', '*']
+    # ── benchmark relay ───────────────────────────────────────────────────────────
+    relay_out = os.path.join( path , "Single relay per channel","Single relay per channel" )
+    os.makedirs(os.path.join(relay_out , "outputs",""), exist_ok=True)
+    torch.save(SNR_dB_vec,         os.path.join(relay_out , "outputs","SNR.pt"))
+    torch.save(overall_worst_BER,  os.path.join(relay_out , "outputs","worst_BER.pt"))
+    torch.save(worst_ch_relay,     os.path.join(relay_out , "outputs","relay_chosen.pt"))
+    print(f"Relay benchmark saved  → {relay_out}outputs\\")
 
-plt.figure(figsize=(10, 6))
-plt.style.use('classic')
-plt.rcParams['font.family'] = 'DejaVu Sans'
-plt.rcParams['font.size']   = 12
+    # ── benchmark direct link ─────────────────────────────────────────────────────
+    direct_out = os.path.join( path , "Direct link","Direct link" )
+    os.makedirs(os.path.join(direct_out , "outputs",""), exist_ok=True)
+    torch.save(SNR_dB_vec,        os.path.join(direct_out , "outputs","SNR.pt"))
+    torch.save(direct_worst_BER,  os.path.join(direct_out , "outputs","worst_BER.pt"))
+    print(f"Direct link benchmark saved → {direct_out}outputs\\")
 
-plt.title('BER vs SNR — worst channel benchmark\n'
-          '(relay re-selected per SNR point  |  simple BPSK demodulator)',
-          fontsize=13)
-plt.xlabel('SNR (dB)', fontsize=12)
-plt.ylabel('BER (log scale)', fontsize=12)
-plt.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
+    # ─────────────────────────────────────────────────────────────────────────────
+    # BER vs SNR plot — worst channel only, relay=blue, direct=red
+    # ─────────────────────────────────────────────────────────────────────────────
 
-plt.semilogy(snr_np, overall_worst_BER.numpy(),
-             color='blue', linestyle='-', marker='o',
-             linewidth=2.5, markersize=7,
-             label="Best relay per channel (benchmark)")
+    snr_np = SNR_dB_vec.numpy()
+    marks  = ['o', '^', 's', 'D', 'P', '*']
 
-plt.semilogy(snr_np, direct_worst_BER.numpy(),
-             color='red', linestyle='--', marker='^',
-             linewidth=2.0, markersize=7,
-             label="Direct link (no relay)")
+    plt.figure(figsize=(10, 6))
+    plt.style.use('classic')
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    plt.rcParams['font.size']   = 12
 
-plt.legend(loc='upper right', fontsize=11)
-plt.tight_layout()
+    plt.title('BER vs SNR — worst channel benchmark\n'
+            '(relay re-selected per SNR point  |  simple BPSK demodulator)',
+            fontsize=13)
+    plt.xlabel('SNR (dB)', fontsize=12)
+    plt.ylabel('BER (log scale)', fontsize=12)
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
 
-plot_path = path + "Single relay per channel\\Single relay per channel\\outputs\\BER_vs_SNR.png"
-plt.savefig(plot_path, dpi=150)
-plt.show()
-print(f"Plot saved → {plot_path}")
+    plt.semilogy(snr_np, overall_worst_BER.numpy(),
+                color='blue', linestyle='-', marker='o',
+                linewidth=2.5, markersize=7,
+                label="Best relay per channel (benchmark)")
+
+    plt.semilogy(snr_np, direct_worst_BER.numpy(),
+                color='red', linestyle='--', marker='^',
+                linewidth=2.0, markersize=7,
+                label="Direct link (no relay)")
+
+    plt.legend(loc='upper right', fontsize=11)
+    plt.tight_layout()
+
+    plot_path = os.path.join(path, "Single relay per channel", "Single relay per channel", "outputs", "BER_vs_SNR.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.show()
+    print(f"Plot saved → {plot_path}")

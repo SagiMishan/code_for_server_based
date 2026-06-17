@@ -20,7 +20,7 @@ from code_GUI.GUI_input import save_params_to_file, parse_params_txt
 torch.manual_seed(20602026)
 
 # init\general parameters
-_GPU_PARAMS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameters.txt")
+_GPU_PARAMS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameters_comp.txt")
 
 
 params = parse_params_txt(_GPU_PARAMS_FILE)
@@ -63,7 +63,7 @@ device = (
     if torch.backends.mps.is_available()
     else "cpu"
 )
-for idx in range(5,10):
+for idx in range(100):
     Name_of_model = f"{orignal_Name_of_model}_{idx}"
     if not os.path.exists(os.path.join(Name_of_model)):
         start_from_zero = True
