@@ -51,19 +51,37 @@ z0_init=params["z0_init"]
 z0_end=params["z0_end"]
 B=params["B"]
 sub_stages=params["sub_stages"]
+SNR_log=params.get("SNR_log", 10.0)
 
 total_users = sum(N_users)
 modCode_order = [2 ** N for N in N_users]
 
-# Get cpu, gpu or mps device for training.
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.backends.mps.is_available()
-    else "cpu"
-)
-for idx in range(100):
+# ── Slurm job-array parallelism ───────────────────────────────────────────────
+# When run via sbatch --array=0-99, SLURM_ARRAY_TASK_ID selects the realisation
+# index. Each array job gets its own GPU (--gres=gpu:1), so up to 4 run in
+# parallel on dsicsgpu10. When run locally (no array), falls back to idx=0.
+_array_id = os.environ.get("SLURM_ARRAY_TASK_ID", None)
+if _array_id is not None:
+    # Running inside a Slurm job array — train exactly this one realisation
+    _run_indices = [int(_array_id)]
+else:
+    # Running locally — train realisations sequentially (original behaviour)
+    _run_indices = list(range(100))
+
+# Select GPU based on local rank within the node so multiple array jobs on the
+# same node each get a different GPU (Slurm sets SLURM_LOCALID / CUDA_VISIBLE_DEVICES)
+if torch.cuda.is_available():
+    # Slurm with --gres=gpu:1 sets CUDA_VISIBLE_DEVICES to the assigned GPU,
+    # so "cuda:0" always refers to the correct physical GPU.
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
+
+print(f"Using device: {device}  |  realisations to train: {_run_indices}")
+
+for idx in _run_indices:
     Name_of_model = f"{orignal_Name_of_model}_{idx}"
     if not os.path.exists(os.path.join(Name_of_model)):
         start_from_zero = True
@@ -253,7 +271,8 @@ for idx in range(100):
                             max_iteration=max_iteration,
                             BER_th=BER_th,
                             device=device,
-                            path=path)
+                            path=path,
+                            SNR_log=SNR_log)
     # if does_stage_1:
     #     plotSNRvsBER(model=model,
     #                  num_itr=5,
@@ -277,7 +296,8 @@ for idx in range(100):
                 z0_init=z0_init,
                 z0_end=z0_end,
                 B=B,
-                sub_stages=sub_stages
+                sub_stages=sub_stages,
+                SNR_log=SNR_log,
                 )
         # plotSNRvsBER(model=model,
         #              num_itr=5,
@@ -307,7 +327,8 @@ for idx in range(100):
                 SNR_step=SNR_step,
                 max_iteration=max_iteration,
                 path=path,
-                SNR_val=max_snr_train)
+                SNR_val=max_snr_train,
+                SNR_log=SNR_log)
         # plotSNRvsBER(model=model,
         #              num_itr=5,
         #              batch=10 ** 5,
@@ -325,7 +346,7 @@ for idx in range(100):
 
 
 
-    plot_symbols(model=model,path = path)
+    # plot_symbols(model=model,path = path)
     # compere_all_stages(model=model, path=path, batch_size=int(10**4),
     #                    SNR=torch.linspace(max_snr_train - 10, max_snr_train + 10, 21), num_itr=100)
 
