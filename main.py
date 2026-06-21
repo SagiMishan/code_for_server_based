@@ -17,7 +17,6 @@ from code_GUI.GUI_input import save_params_to_file, parse_params_txt
 
 
 # source ./.venv/bin/activate
-torch.manual_seed(20602026)
 
 # init\general parameters
 _GPU_PARAMS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameters_comp.txt")
@@ -82,6 +81,7 @@ else:
 print(f"Using device: {device}  |  realisations to train: {_run_indices}")
 
 for idx in _run_indices:
+    
     Name_of_model = f"{orignal_Name_of_model}_{idx}"
     if not os.path.exists(os.path.join(Name_of_model)):
         start_from_zero = True

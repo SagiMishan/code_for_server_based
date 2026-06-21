@@ -1,0 +1,53 @@
+
+ssh dml17
+cd ./projects/code_for_server_based/
+source ./.venv/bin/activate
+
+
+
+
+
+
+nohup python random_networks.py > log_files/random_output.log 2>&1 &
+ps aux | grep python
+
+
+
+# to setup the venv in the cpu and gpu
+conda activate relay_env
+cd /home/dsi/mishans1/projects/code_for_server_based
+
+# CPU venv
+python -m venv .venv_cpu
+conda deactivate
+source .venv_cpu/bin/activate
+pip install torch torchvision torchaudio matplotlib numpy
+deactivate
+
+# GPU venv
+conda activate gui_env 
+python -m venv .venv_gpu
+conda deactivate
+source .venv_gpu/bin/activate
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install matplotlib numpy scipy tqdm
+deactivate
+
+
+
+# For running multypal jobs in the same GPU
+cd ./projects/code_for_server_based
+source ./.venv_gpu/bin/activate
+bash ./bush_and_server_helpers/run_all_gpu_safe.sh 0 3
+sleep 5
+ps aux | grep main.py
+bash ./bush_and_server_helpers/manage_claims.sh status
+
+
+# Need to be done for each GPU is been used if we want to stop the running
+pkill -f main.py
+pkill -f run_gpu_slot
+# clear all the cash and memory from the running (need to be done once)
+# bash manage_claims.sh clear-all
+rm -rf simulation/log_files/compare_models/eval_claims
+rm -rf simulation/log_files/compare_models/eval_logs
