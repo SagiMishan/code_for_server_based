@@ -71,11 +71,11 @@ class Network_single_channel(nn.Module):
         self.transmitNN = TransmitorNN(N_users = self.N_users,N_tx=N_tx)
 
         w = self.randomComplexNormal((self.N_relays, 1), sigma=0.1)
-        w[list(useless_relays)] = torch.tensor(0,dtype=torch.complex64)
+        # w[list(useless_relays)] = torch.tensor(0,dtype=torch.complex64)
         self.w = nn.Parameter(w)
 
         b = self.randomComplexNormal((self.N_relays, 1), sigma=0.1)
-        b[list(useless_relays)] = torch.tensor(0,dtype=torch.complex64)
+        # b[list(useless_relays)] = torch.tensor(0,dtype=torch.complex64)
         self.b = nn.Parameter(b)
 
         self.V = torch.ones((self.N_relays, 1))
@@ -167,8 +167,8 @@ class Network_single_channel(nn.Module):
             leafs = torch.where(numOfConnections == 0)[0]
             if source_index in indexes[leafs]:
                 print("source have source :(" + "-" * 20)
-                continue
-
+                return None
+               
             # save the leafs index
             Layers.append(indexes[leafs])
             # remove leaves from the matrix

@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import os
 from code_Networks.SmallFunctions import Single_channel_loss_function, Multy_channel_loss_function, dB2lin
+import time
 
 
 def _add_z0_axis(ax_main, itr, z0_ds, color_z0='tab:orange'):
@@ -250,7 +251,7 @@ def _plot_all(log: dict, z0_full: torch.Tensor, path: str,
 
 
 def train_multy_channel(model, num_itr, loss_fn, optimizer, path, z0,
-                        batch=100, SNR=1e-3, max_V=0):
+                        batch=100, SNR=1e-3, max_V=0, SNR_log=None):
     """
     Run one epoch of multi-channel training (stage 2).
 
@@ -279,6 +280,7 @@ def train_multy_channel(model, num_itr, loss_fn, optimizer, path, z0,
         v_score=[],
         n_drops=[],
         worst_BER=[],
+        BER_log_snr=[],
         BER_per_ch={c: [] for c in range(C)},
         n_relays_per_ch={c: [] for c in range(C)},
         w_norm_per_ch={c: [] for c in range(C)},
@@ -293,14 +295,24 @@ def train_multy_channel(model, num_itr, loss_fn, optimizer, path, z0,
     all_bits = [None] * C
 
     _device = next(model.parameters()).device
+    snr_lin_low  = float(dB2lin(SNR))    # plain float — must not enter autograd graph
+    snr_lin_high = float(dB2lin(SNR + 5))
+    snr_log_lin  = float(dB2lin(SNR_log)) if SNR_log is not None else None
+
     for itr in range(num_itr):
         optimizer.zero_grad()
         loss = torch.tensor(0.0, dtype=torch.float, device=_device)
 
         for c in range(C):
             model.sub_networks[c].train()
-            model.sub_networks[c].SNR = dB2lin(SNR)
-            sum_v_c = model.sub_networks[c].V.sum()
+            model.sub_networks[c].SNR = snr_lin_low
+
+            # Recompute V fresh from w/b right now — never read self.V which
+            # may reference a tensor version invalidated by inplace ops.
+            w_norm = model.sub_networks[c].w.norm(2, dim=1, keepdim=True).clamp(min=1e-8)
+            b_norm = model.sub_networks[c].b.norm(2, dim=1, keepdim=True).clamp(min=1e-8)
+            V_fresh = torch.clamp(1 - torch.exp(-w_norm - b_norm), max=1-1e-8, min=1e-8)
+            sum_v_c = V_fresh.sum()
 
             signal_low, bits_low = model.sub_networks[c].modulator(batch)
             rm_low = model.sub_networks[c](signal_low, bits_low)
@@ -309,16 +321,14 @@ def train_multy_channel(model, num_itr, loss_fn, optimizer, path, z0,
             all_pred[c] = pred_low.detach()
             all_bits[c] = bits_low
 
-            loss_low = loss_fn(pred_low, bits_low * 2 - 1)+ 1e-1 * sum_v_c / N
+            loss_low = loss_fn(pred_low, bits_low * 2 - 1) + 1e-1 * sum_v_c / N
 
-
-            model.sub_networks[c].SNR = dB2lin(SNR + 5)
+            model.sub_networks[c].SNR = snr_lin_high
             signal_high, bits_high = model.sub_networks[c].modulator(batch)
             rm_high = model.sub_networks[c](signal_high, bits_high)
             pred_high = model.sub_networks[c].demodulator(rm_high)
 
-
-            loss_high = loss_fn(pred_high, bits_high * 2 - 1)+ 1e-1 * sum_v_c / N
+            loss_high = loss_fn(pred_high, bits_high * 2 - 1) + 1e-1 * sum_v_c / N
             loss = loss + torch.sqrt(loss_low * loss_high)
 
 
@@ -378,15 +388,29 @@ def train_multy_channel(model, num_itr, loss_fn, optimizer, path, z0,
             loss_val = loss.item()
             runnig_loss[li] = loss_val
 
-            score = model.learn_score()
+            score = _fast_learn_score(model)  # reuses V from update_v() above
             SCORE[li] = score
+
+            # ── V score (total across all channels, kept for print string) ──────
+            v_per_ch = {}
+            for c in range(C):
+                v_per_ch[c] = model.sub_networks[c].V.detach().cpu().mean().item()
+
+            # ── BER at fixed SNR_log (all channels, eval mode) ────────────────
+            ber_at_log_snr = None
+            if snr_log_lin is not None:
+                ber_at_log_snr = _log_ber_all_channels(model, snr_log_lin)
+                log['BER_log_snr'].append(ber_at_log_snr)
+            else:
+                log['BER_log_snr'].append(None)
 
             runnig_drops[li] = moving_drops if itr == 0 else moving_drops / 100
 
             # ── per-channel metrics ───────────────────────────────────────────
             total_worst = 0.0
             score_detach = score.detach()
-            out_string = "{:<2}/{} score={:.4f}".format(li + 1, LOG, float(score_detach))
+            v_ch_str = " | ".join("ch{} V={:.4f}".format(c, v_per_ch[c]) for c in range(C))
+            out_string = "{:<2}/{} score={:.4f}  [{}]".format(li + 1, LOG, float(score_detach), v_ch_str)
 
             for c in range(C):
                 worst_BER, avg_BER, best_BER = model.sub_networks[c].BER(
@@ -423,6 +447,8 @@ def train_multy_channel(model, num_itr, loss_fn, optimizer, path, z0,
 
             out_string += "  z0={:.4f}  drops={:.1f}".format(
                 float(z0[itr]), runnig_drops[li])
+            if ber_at_log_snr is not None:
+                out_string += "  BER@{:.0f}dB={:.4f}".format(SNR_log, ber_at_log_snr)
             print(out_string)
 
             moving_drops = 0
@@ -452,61 +478,169 @@ def _fast_learn_score(model):
     return (score / model.N_relays).item()
 
 
+
+def _log_ber_all_channels(model, snr_lin,batch=100000):
+    """
+    Evaluate BER for every channel jointly, return worst BER.
+    snr_lin: pre-computed linear SNR as a plain Python float.
+    """
+    model.eval()
+    with torch.no_grad():
+        worst = 0.0
+        for c in range(model.N_channels):
+            model.sub_networks[c].SNR = snr_lin
+            sig, bits = model.sub_networks[c].modulator(batch)
+            rm   = model.sub_networks[c](sig, bits)
+            pred = model.sub_networks[c].demodulator(rm)
+            w_ber, _, _ = model.sub_networks[c].BER(bits=bits, pred=pred)
+            worst = max(worst, float(w_ber))
+    model.train()
+    return worst
+
+
+def _joint_train_step(model, loss_fn, optimizer, batch, snr_lin_low, snr_lin_high, _device):
+    """
+    One forward+backward step over ALL channels jointly.
+    snr_lin_low/high are pre-computed plain Python floats (not tensors).
+    _device is pre-computed once per epoch by the caller (avoids traversing
+    model.parameters() on every iteration).
+    Returns (loss_val, all_pred list, all_bits list).
+    """
+    optimizer.zero_grad()
+    loss = torch.tensor(0.0, dtype=torch.float, device=_device)
+    all_pred, all_bits = [], []
+    for c in range(model.N_channels):
+        model.sub_networks[c].SNR = snr_lin_low
+
+        sig_low,  bits_low  = model.sub_networks[c].modulator(batch)
+        rm_low               = model.sub_networks[c](sig_low, bits_low)
+        pred_low             = model.sub_networks[c].demodulator(rm_low)
+        loss_low = loss_fn(pred_low, (bits_low * 2 - 1).float())
+
+        model.sub_networks[c].SNR = snr_lin_high
+        sig_high, bits_high  = model.sub_networks[c].modulator(batch)
+        rm_high              = model.sub_networks[c](sig_high, bits_high)
+        pred_high            = model.sub_networks[c].demodulator(rm_high)
+        loss_high = loss_fn(pred_high, (bits_high * 2 - 1).float())
+
+        loss = loss + torch.sqrt(loss_low * loss_high)
+        all_pred.append(pred_low.detach())
+        all_bits.append(bits_low)
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+    return loss.item(), all_pred, all_bits
+
+
 def stage_1(model, basic_training, SNR_basic_trainning, SNR_max, SNR_step, max_iteration, BER_th,
-            device, path):
+            device, path, SNR_log=None):
+    """
+    Stage 1: pre-train all channels jointly.
+    All channels share one optimizer and train together every iteration.
+    The SNR curriculum (flag_BER / BER_th / SNR_step) is driven by the
+    worst BER across all channels, so the schedule is identical in spirit
+    to the original per-channel logic.
+    """
     loss_fn_SC = Single_channel_loss_function
     if basic_training:
-        max_snr_train = -100000
-        for c in range(model.N_channels):
-            SNR = SNR_max
-            flag_BER = False
-            optimizer = torch.optim.Adam(model.sub_networks[c].parameters(), lr=1e-3)
-            epochs = 0
-            while True:
-                if not flag_BER:
-                    print("stage 1 - channel {} -- Epoch {} - SNR: {:.2f}\n"
-                          "-------------------------------".format(c, epochs, SNR_basic_trainning))
-                    BER, loss = model.train_single_channel(num_itr=1000, model_idx=c,
-                                                           loss_fn=loss_fn_SC, optimizer=optimizer,
-                                                           device=device, batch=512,
-                                                           SNR=SNR_basic_trainning)
-                    epochs += 1
-                    if np.mean(BER) == 0:
-                        epochs = 0
-                        flag_BER = True
-                        print("changed flag")
-                    if epochs >= max_iteration:
-                        break
-                else:
-                    print("stage 1 - channel {} -- Epoch {} - SNR: {:.2f}\n"
-                          "-------------------------------".format(c, epochs, SNR))
-                    BER, loss = model.train_single_channel(num_itr=1000, model_idx=c,
-                                                           loss_fn=loss_fn_SC, optimizer=optimizer,
-                                                           device=device, batch=2 ** 7, SNR=SNR)
-                    if np.mean(BER) < max(BER_th, 2 ** -7):
-                        SNR = SNR - SNR_step
-                        epochs = 0
-                    if epochs >= max_iteration:
-                        break
-                    epochs += 1
-                # print("testing")
-                # model.test_single_channel(model_idx=c, loss_fn=loss_fn_SC, device=device,
-                #                           batch=2 ** 7,
-                #                           SNR=torch.linspace(SNR - 10, SNR + 10, 21))
-            max_snr_train = max(SNR, max_snr_train)
-            print("Done! training")
+        N = model.N_relays
+        C = model.N_channels
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        SNR    = SNR_max
+        flag_BER = False
+        epochs = 0
 
-        torch.save(max_snr_train, os.path.join(path, "data", "max_snr_train_stage_1"))
+        # ── log accumulators ──────────────────────────────────────────────────
+        log_s1 = dict(
+            training_snr=[],    # SNR used for each logged step
+            BER_train=[],       # worst BER across channels (at training SNR)
+            BER_log_snr=[],     # worst BER at fixed SNR_log
+            v_score=[],         # total V score across all channels
+        )
+
+        _device = next(model.parameters()).device
+        while True:
+            cur_snr = SNR_basic_trainning if not flag_BER else SNR
+            batch   = 512              if not flag_BER else 2 ** 10
+            # pre-compute SNR tensors once per epoch
+            snr_lin_low  = float(dB2lin(cur_snr))
+            snr_lin_high = float(dB2lin(cur_snr + 5))
+            snr_log_lin  = float(dB2lin(SNR_log)) if SNR_log is not None else None
+            print("stage 1 (joint) -- Epoch {} - SNR: {:.2f}\n"
+                  "-------------------------------".format(epochs, cur_snr))
+
+            # ── one epoch = 1000 joint steps ──────────────────────────────────
+            BER_epoch = np.zeros((1000 // 100, 1))
+            _epoch_t0 = time.time()
+            for itr in range(1000):
+                loss_val, all_pred, all_bits = _joint_train_step(
+                    model, loss_fn_SC, optimizer, batch, snr_lin_low, snr_lin_high, _device)
+
+                if itr % 100 == 0:
+                    model.update_v()
+                    model.culc_p()
+                    score = _fast_learn_score(model)  # reuses V already computed
+                    worst = 0.0
+                    v_strs = []
+                    for c in range(C):
+                        w_ber, _, _ = model.sub_networks[c].BER(
+                            bits=all_bits[c], pred=all_pred[c])
+                        worst = max(worst, float(w_ber))
+                        v_strs.append("ch{} V={:.4f}".format(
+                            c, model.sub_networks[c].V.detach().cpu().mean().item()))
+                    log_s1['v_score'].append(float(score))
+                    BER_epoch[itr // 100] = worst
+                    log_s1['training_snr'].append(float(cur_snr))
+                    log_s1['BER_train'].append(float(worst))
+
+                    log_str = "  itr {:>3} loss={:.5f}  BER={:.4f}  score={:.4f}  [{}]".format(
+                        itr, loss_val, worst, float(score), " | ".join(v_strs))
+                    if SNR_log is not None:
+                        ber_log = _log_ber_all_channels(model, snr_log_lin)
+                        log_s1['BER_log_snr'].append(float(ber_log))
+                        log_str += "  BER@{:.0f}dB={:.4f}".format(SNR_log, ber_log)
+                    else:
+                        log_s1['BER_log_snr'].append(None)
+                    print(log_str)
+
+            _epoch_elapsed = time.time() - _epoch_t0
+            print("  [timing] epoch took {:.1f}s  ({:.1f} ms/iter)".format(
+                _epoch_elapsed, _epoch_elapsed))
+
+            # ── curriculum update ─────────────────────────────────────────────
+            if not flag_BER:
+                epochs += 1
+                if np.mean(BER_epoch) == 0:
+                    epochs   = 0
+                    flag_BER = True
+                    print("changed flag")
+                if epochs >= max_iteration:
+                    break
+            else:
+                if np.mean(BER_epoch) < max(BER_th, 2 ** -10):
+                    SNR    = SNR - SNR_step
+                    epochs = 0
+                    print("SNR decreased to {:.2f}".format(SNR))
+                else:
+                    epochs += 1
+                if epochs >= max_iteration:
+                    break
+
+        print("Done! stage 1 training")
+        log_s1['SNR_log'] = SNR_log
+        torch.save(log_s1, os.path.join(path, "outputs", "stage1_log.pt"))
+        torch.save(SNR, os.path.join(path, "data", "max_snr_train_stage_1"))
         model.save(path, "stage_1")
     else:
-        model.load(path, "stage_1",device=device)
-        max_snr_train = torch.load(os.path.join(path, "data", "max_snr_train_stage_1"), weights_only=True)
+        model.load(path, "stage_1", device=device)
+        SNR = torch.load(os.path.join(path, "data", "max_snr_train_stage_1"), weights_only=True)
 
-    return max_snr_train
+    return SNR
 
 
 def stage_2(model, max_snr_train, epochs, device, path, z0_type, sub_stages,
-            z0_init=0.01, z0_end=0.01, B=torch.tensor(10)):
+            z0_init=0.01, z0_end=0.01, B=torch.tensor(10), SNR_log=None):
     loss_fn_SC = Single_channel_loss_function
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
@@ -553,6 +687,7 @@ def stage_2(model, max_snr_train, epochs, device, path, z0_type, sub_stages,
             z0=z0_epoch,
             path=path,
             max_V=max_V,
+            SNR_log=SNR_log,
         )
 
         ALL_SCORE.append(score)
@@ -600,6 +735,7 @@ def stage_2(model, max_snr_train, epochs, device, path, z0_type, sub_stages,
         v_score=[],
         n_drops=[],
         worst_BER=[],
+        BER_log_snr=[],
         BER_per_ch={c: [] for c in range(model.N_channels)},
         n_relays_per_ch={c: [] for c in range(model.N_channels)},
         w_norm_per_ch={c: [] for c in range(model.N_channels)},
@@ -615,6 +751,7 @@ def stage_2(model, max_snr_train, epochs, device, path, z0_type, sub_stages,
         merged['n_drops'] += lg['n_drops']
         merged['worst_BER'] += lg['worst_BER']
         merged['bais_probability'] += lg['bais_probability']
+        merged['BER_log_snr'] += lg['BER_log_snr']
         for c in range(model.N_channels):
             merged['BER_per_ch'][c] += lg['BER_per_ch'][c]
             merged['n_relays_per_ch'][c] += lg['n_relays_per_ch'][c]
@@ -622,56 +759,111 @@ def stage_2(model, max_snr_train, epochs, device, path, z0_type, sub_stages,
             merged['b_norm_per_ch'][c] += lg['b_norm_per_ch'][c]
             merged['p_entropy_per_ch'][c] += lg['p_entropy_per_ch'][c]
 
-    # Save merged raw data
-    torch.save(merged, os.path.join(path, 'data', 'stage2_all_epochs_raw.pt'))
+    # Save merged raw data (include the training SNR used for context)
+    merged['training_snr'] = max_snr_train   # scalar — same for all stage-2 itr
+    merged['SNR_log'] = SNR_log
+    torch.save(merged, os.path.join(path, 'outputs', 'stage2_all_epochs_raw.pt'))
 
     # Cumulative plots (epoch = 0 → "all" label)
     _plot_all(merged, z0, path, epoch="all")  # 0 → saved as e00_*.png  (= cumulative)
 
     print("\nDone! stage 2 training")
     print(f"  Plots saved to  {os.path.join(path, 'outputs')}")
-    print(f"  Raw data saved to {os.path.join(path, 'data')}")
+    print(f"  Logs saved to {os.path.join(path, 'outputs')}")
 
 
 def stage_3(model, SNR_basic_trainning, SNR_max, SNR_step, max_iteration, BER_th, device, SNR_val,
-            path):
+            path, SNR_log=None):
+    """
+    Stage 3: fine-tune all channels jointly with frozen assignment (set_weights already
+    called before entry).  Same SNR curriculum logic as stage 1, applied across all
+    channels together.
+    """
     loss_fn_SC = Single_channel_loss_function
-    for c in range(model.N_channels):
-        SNR = SNR_max
-        epochs = 0
-        flag_BER = False
-        optimizer = torch.optim.Adam(model.sub_networks[c].parameters(), lr=1e-3)
-        while True:
-            if not flag_BER:
-                print("stage 3 - channel {} -- Epoch {} - SNR: {:.2f}\n"
-                      "-------------------------------".format(c, epochs, SNR_basic_trainning))
-                BER, loss = model.train_single_channel(num_itr=1000, model_idx=c,
-                                                       loss_fn=loss_fn_SC, optimizer=optimizer,
-                                                       device=device, batch=512,
-                                                       SNR=SNR_basic_trainning, stage3=True)
-                epochs += 1
-                if np.mean(BER) == 0:
-                    epochs = 0
-                    flag_BER = True
-                    print("changed flag")
-                if epochs >= max_iteration:
-                    break
+    N = model.N_relays
+    C = model.N_channels
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    SNR      = SNR_max
+    flag_BER = False
+    epochs   = 0
+
+    # ── log accumulators ──────────────────────────────────────────────────────
+    log_s3 = dict(
+        training_snr=[],
+        BER_train=[],
+        BER_log_snr=[],
+        v_score=[],         # total V score across all channels
+    )
+
+    _device = next(model.parameters()).device
+    while True:
+        cur_snr = SNR_basic_trainning if not flag_BER else SNR
+        batch   = 512              if not flag_BER else 2 ** 10
+        # pre-compute SNR tensors once per epoch
+        snr_lin_low  = float(dB2lin(cur_snr))
+        snr_lin_high = float(dB2lin(cur_snr + 5))
+        snr_log_lin  = float(dB2lin(SNR_log)) if SNR_log is not None else None
+        print("stage 3 (joint) -- Epoch {} - SNR: {:.2f}\n"
+              "-------------------------------".format(epochs, cur_snr))
+
+        # ── one epoch = 1000 joint steps ──────────────────────────────────────
+        BER_epoch = np.zeros((1000 // 100, 1))
+        _epoch_t0 = time.time()
+        for itr in range(1000):
+            loss_val, all_pred, all_bits = _joint_train_step(
+                model, loss_fn_SC, optimizer, batch, snr_lin_low, snr_lin_high, _device)
+
+            if itr % 100 == 0:
+                model.update_v()
+                model.culc_p()
+                score = _fast_learn_score(model)  # reuses V already computed
+                worst = 0.0
+                v_strs = []
+                for c in range(C):
+                    w_ber, _, _ = model.sub_networks[c].BER(
+                        bits=all_bits[c], pred=all_pred[c])
+                    worst = max(worst, float(w_ber))
+                    v_strs.append("ch{} V={:.4f}".format(
+                        c, model.sub_networks[c].V.detach().cpu().mean().item()))
+                BER_epoch[itr // 100] = worst
+                log_s3['v_score'].append(float(score))
+                log_s3['training_snr'].append(float(cur_snr))
+                log_s3['BER_train'].append(float(worst))
+
+                log_str = "  itr {:>3} loss={:.5f}  BER={:.4f}  score={:.4f}  [{}]".format(
+                    itr, loss_val, worst, float(score), " | ".join(v_strs))
+                if SNR_log is not None:
+                    ber_log = _log_ber_all_channels(model, snr_log_lin)
+                    log_s3['BER_log_snr'].append(float(ber_log))
+                    log_str += "  BER@{:.0f}dB={:.4f}".format(SNR_log, ber_log)
+                else:
+                    log_s3['BER_log_snr'].append(None)
+                print(log_str)
+
+        _epoch_elapsed = time.time() - _epoch_t0
+        print("  [timing] epoch took {:.1f}s  ({:.1f} ms/iter)".format(
+            _epoch_elapsed, _epoch_elapsed))
+
+        # ── curriculum update ──────────────────────────────────────────────────
+        if not flag_BER:
+            epochs += 1
+            if np.mean(BER_epoch) == 0:
+                epochs   = 0
+                flag_BER = True
+                print("changed flag")
+            if epochs >= max_iteration:
+                break
+        else:
+            if np.mean(BER_epoch) < max(BER_th, 2 ** -10):
+                SNR    = SNR - SNR_step
+                epochs = 0
+                print("SNR decreased to {:.2f}".format(SNR))
             else:
-                print("stage 3 - channel {} -- Epoch {} - SNR: {:.2f}\n"
-                      "-------------------------------".format(c, epochs, SNR))
-                BER, loss = model.train_single_channel(num_itr=1000, model_idx=c,
-                                                       loss_fn=loss_fn_SC, optimizer=optimizer,
-                                                       device=device, batch=2 ** 7, SNR=SNR,
-                                                       stage3=True)
-                if np.mean(BER) < max(BER_th, 2 ** -7):
-                    SNR = SNR - SNR_step
-                    epochs = 0
-                if epochs >= max_iteration:
-                    break
                 epochs += 1
-            # print("testing")
-            # model.test_single_channel(model_idx=c, loss_fn=loss_fn_SC, device=device,
-            #                           batch=2 ** 7,
-            #                           SNR=torch.linspace(SNR_val - 10, SNR_val + 10, 21))
+            if epochs >= max_iteration:
+                break
+
+    log_s3['SNR_log'] = SNR_log
+    torch.save(log_s3, os.path.join(path, "outputs", "stage3_log.pt"))
     model.save(path, "stage_3")
-    print("Done! training")
+    print("Done! stage 3 training")
