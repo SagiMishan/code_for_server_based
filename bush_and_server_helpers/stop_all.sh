@@ -19,7 +19,6 @@ for NODE in "${NODES[@]}"; do
     echo "── Stopping jobs on $NODE ──────────────────────────────"
     timeout 10 ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$NODE" '
         pkill -9 -f run_gpu_slot 2>/dev/null
-        pkill -9 -f main.py 2>/dev/null
         pkill -9 -f /home/dsi/mishans1/projects/code_for_server_based/code_compare_results/evaluate_all_networks.py 2>/dev/null
         pkill -9 -f /home/dsi/mishans1/projects/code_for_server_based/code_compare_results/random_networks.py 2>/dev/null
         echo "  done."

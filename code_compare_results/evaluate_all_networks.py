@@ -15,15 +15,31 @@ Each saved .pt file is a dict: {"SNR": tensor[N_snr], "BER": tensor[N_channels, 
 
 Built on top of Network_multy_channels.load_model / evaluate_model
 (same conventions as compare_models.py).
+
+── PARALLEL EXECUTION ─────────────────────────────────────────────────────────
+This script trains/evaluates one realisation (idx) at a time and is safe to
+run across multiple GPUs and multiple nodes simultaneously:
+
+  - Set CUDA_VISIBLE_DEVICES=<gpu_id>            to pin a process to one GPU
+  - Set SLURM_ARRAY_TASK_ID=<idx>                to evaluate only that one idx
+  - Without SLURM_ARRAY_TASK_ID, all idx 0..N_NETWORKS-1 run sequentially
+    (original behaviour).
+
+Cross-node / cross-GPU safety is handled with the same atomic `mkdir` claim
+mechanism used by run_all_gpu_safe.sh: before evaluating model idx, a process
+atomically creates simulation/eval_claims/eval_<idx>.claim. mkdir is atomic
+even across machines sharing the same NFS mount, so two GPUs (on the same or
+different nodes) can never evaluate the same network twice.
+
+Use run_eval_all_gpu_safe.sh to launch this across all your idle GPUs/nodes.
 """
 
 import sys
+import os
 from pathlib import Path
 # Add the main folder (parent of code_compare_results, etc.) to sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-
-import os
 import torch
 from tqdm import tqdm
 
@@ -34,7 +50,7 @@ from code_Networks.Network_multy_channels import Network_multy_channel, load_mod
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-BASE_PATH     = "/home/dsi/mishans1/projects/code_for_server_based/"
+BASE_PATH     = "/home/dsi/mishans1/projects/code_for_server_based/simulation/compare_networks"
 ORIGINAL_NAME = "compare_networks"
 N_NETWORKS    = 10
 
@@ -47,6 +63,9 @@ STAGES = (1, 2, 3)
 # If True, skip evaluation for any (model, stage) that already has
 # outputs/eval_stage_<s>.pt saved on disk.
 SKIP_EXISTING = True
+
+# Claim folder for cross-node/cross-GPU coordination (NFS-shared)
+CLAIM_DIR = "/home/dsi/mishans1/projects/code_for_server_based/simulation/eval_claims"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,6 +90,32 @@ def _select_device() -> str:
 
 DEVICE = _select_device()
 print(f"Using device: {DEVICE}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Claim helpers (cross-node safe, NFS-backed, atomic via mkdir)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def try_claim(idx: int) -> bool:
+    """Atomically claim evaluation of network idx. Returns True if this
+    process won the claim, False if another process already owns it."""
+    os.makedirs(CLAIM_DIR, exist_ok=True)
+    claim_path = os.path.join(CLAIM_DIR, f"eval_{idx}.claim")
+    try:
+        os.mkdir(claim_path)  # atomic on POSIX/NFS - fails if it already exists
+    except FileExistsError:
+        return False
+
+    node = os.environ.get("SLURMD_NODENAME") or os.uname().nodename
+    gpu  = os.environ.get("CUDA_VISIBLE_DEVICES", "?")
+    with open(os.path.join(claim_path, "owner.txt"), "w") as f:
+        f.write(f"{node} GPU{gpu}\n")
+    return True
+
+
+def mark_done(idx: int) -> None:
+    claim_path = os.path.join(CLAIM_DIR, f"eval_{idx}.claim")
+    open(os.path.join(claim_path, "done.txt"), "w").close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,51 +202,71 @@ def evaluate_and_save_stages(data_path: str,
         print(f"  [{label}] stage_{stage}: saved -> {save_path}")
 
 
+def evaluate_one_network(idx: int) -> None:
+    """Evaluate a single network realisation (all its sub-models)."""
+    name_of_model = f"{ORIGINAL_NAME}_{idx}"
+    main_path = os.path.join(BASE_PATH, name_of_model, "")
+
+    if not os.path.isdir(main_path):
+        print(f"{name_of_model}: folder not found, skipping")
+        return
+
+    original_stdout = sys.stdout
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        # ── main model ──────────────────────────────────────────────────
+        evaluate_and_save_stages(data_path=main_path,
+                                 weight_path=main_path,
+                                 label="main")
+
+        # ── random sub-models ───────────────────────────────────────────
+        random_sel_path = os.path.join(main_path, "random_selections")
+        if os.path.isdir(random_sel_path):
+            for sub_name in sorted(os.listdir(random_sel_path)):
+                sub_path = os.path.join(random_sel_path, sub_name, "")
+                if os.path.isdir(sub_path):
+                    evaluate_and_save_stages(data_path=main_path,
+                                        weight_path=sub_path,
+                                        label=f"random_selections/{sub_name}")
+        # ── QAM sub-models ───────────────────────────────────────────
+        qam_sel_path = os.path.join(main_path, "QAM baseline")
+        if os.path.isdir(qam_sel_path):
+            for sub_name in sorted(os.listdir(qam_sel_path)):
+                sub_path = os.path.join(qam_sel_path, sub_name, "")
+                if os.path.isdir(sub_path):
+                    evaluate_and_save_stages(data_path=main_path,
+                                        weight_path=sub_path,
+                                     label=f"QAM baseline/{sub_name}")
+    finally:
+        sys.stdout.close()
+        sys.stdout = original_stdout
+        print(f"{name_of_model}: done.")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-original_stdout = sys.stdout
-
-
 def main():
-    for idx in tqdm(range(N_NETWORKS), desc="Evaluating networks"):
-        name_of_model = f"{ORIGINAL_NAME}_{idx}"
-        main_path = os.path.join(BASE_PATH, name_of_model, "")
+    array_id = os.environ.get("SLURM_ARRAY_TASK_ID", None)
 
-        if not os.path.isdir(main_path):
-            print(f"{name_of_model}: folder not found, skipping")
-            continue
-
-        sys.stdout = open(os.devnull, 'w')
-        try:
-            # ── main model ──────────────────────────────────────────────────
-            # evaluate_and_save_stages(data_path=main_path,
-            #                          weight_path=main_path,
-            #                          label="main")
-
-            # ── random sub-models ───────────────────────────────────────────
-            random_sel_path = os.path.join(main_path, "random_selections")
-            if os.path.isdir(random_sel_path):
-                for sub_name in sorted(os.listdir(random_sel_path)):
-                    sub_path = os.path.join(random_sel_path, sub_name, "")
-                    if os.path.isdir(sub_path):
-                        evaluate_and_save_stages(data_path=main_path,
-                                            weight_path=sub_path,
-                                            label=f"random_selections/{sub_name}")
-            # ── QAM sub-models ───────────────────────────────────────────
-            qam_sel_path = os.path.join(main_path, "QAM baseline")
-            if os.path.isdir(qam_sel_path):
-                for sub_name in sorted(os.listdir(qam_sel_path)):
-                    sub_path = os.path.join(qam_sel_path, sub_name, "")
-                    if os.path.isdir(sub_path):
-                        evaluate_and_save_stages(data_path=main_path,
-                                            weight_path=sub_path,
-                                         label=f"QAM baseline/{sub_name}")
-        finally:
-            sys.stdout.close()
-            sys.stdout = original_stdout
-            print(f"{name_of_model}: done.")
+    if array_id is not None:
+        # Running as one realisation in a parallel job — claim-protected
+        idx = int(array_id)
+        if not try_claim(idx):
+            print(f"compare_networks_{idx}: already claimed by another process, skipping")
+            return
+        evaluate_one_network(idx)
+        mark_done(idx)
+    else:
+        # Original sequential behaviour, also claim-protected so it's safe
+        # to run alongside parallel workers without duplicating work.
+        for idx in tqdm(range(N_NETWORKS), desc="Evaluating networks"):
+            if not try_claim(idx):
+                print(f"compare_networks_{idx}: already claimed by another process, skipping")
+                continue
+            evaluate_one_network(idx)
+            mark_done(idx)
 
 
 if __name__ == "__main__":

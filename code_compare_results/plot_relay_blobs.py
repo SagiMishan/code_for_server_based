@@ -11,10 +11,11 @@ placements can be compared at a glance.
 Usage
 -----
     python plot_relay_blobs.py
-        --prefix  my_model          # folder prefix  (my_model_0, my_model_1, …)
-        --stage   stage_2           # which saved stage to load
-        --save    blobs.png         # output path  (optional)
-        --no-show                   # suppress interactive window
+        --prefix      my_model          # folder prefix  (my_model_0, my_model_1, …)
+        --stage       stage_2           # which saved stage to load
+        --save        blobs.png         # output path  (optional)
+        --models-dir  /path/to/models   # directory containing the model folders
+        --no-show                       # suppress interactive window
 
 All arguments are optional; defaults match the script body below.
 """
@@ -27,17 +28,51 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.colors as mcolors
+from matplotlib.colors import ListedColormap, LinearSegmentedColormap
 from matplotlib.patches import Polygon as MplPolygon
 from scipy.spatial import ConvexHull
 from scipy.stats import gaussian_kde
 import torch
 
-# ── make project modules importable ──────────────────────────────────────────
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+import sys
+from pathlib import Path
+# Add the main folder (parent of code_compare_results, etc.) to sys.path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 
 from code_Networks.Network_multy_channels import Network_multy_channel, load_model as _load_model
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hard-coded configuration  (edit these when running on the server)
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_PREFIX     = "compare_networks"       # folder prefix  →  model_0, model_1, …
+DEFAULT_STAGE      = 2             # integer stage to load (2 = stage_2)
+DEFAULT_SAVE_PATH  = "relay_blobs.png"
+DEFAULT_MODELS_DIR = "/home/dsi/mishans1/projects/code_for_server_based/simulation/compare_networks"          # None → use the script's own directory
+SYSTEM_BW = 0.05          # KDE bandwidth for blob smoothing (0.05–0.3; smaller = tighter to points)
+# ─────────────────────────────────────────────────────────────────────────────
+# CPU/CUDA compatibility
+# ─────────────────────────────────────────────────────────────────────────────
+# Models were trained/saved on CUDA nodes. When this script runs on a
+# CPU-only machine, torch.load tries to restore tensors to their original
+# (CUDA) device and crashes unless map_location is forced to CPU.
+# We force this globally, since the project's own load_model()/load() calls
+# (in Network_multy_channels.py / Network_single_channel.py) do not always
+# pass map_location through.
+_TORCH_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+_orig_torch_load = torch.load
+
+
+def _cpu_safe_torch_load(*args, **kwargs):
+    if not torch.cuda.is_available():
+        kwargs["map_location"] = torch.device("cpu")
+    return _orig_torch_load(*args, **kwargs)
+
+
+torch.load = _cpu_safe_torch_load
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -49,10 +84,17 @@ def _pt(folder, name):
                       weights_only=False)
 
 
-def find_model_folders(prefix):
-    """Return sorted list of existing folders matching <prefix>_<int>."""
+def find_model_folders(prefix, base=None):
+    """Return sorted list of existing folders matching <prefix>_<int>.
+
+    base : str or None
+        Directory to search in. Defaults to the script's own directory
+        if not provided.
+    """
     folders = []
-    base = os.path.dirname(os.path.abspath(__file__))  # always the script's directory
+    if base is None:
+        base = os.path.dirname(os.path.abspath(__file__))  # script's directory
+    base = os.path.abspath(base)
     print(f"Searching for folders in: {base}")
     for entry in os.listdir(base):
         full = os.path.join(base, entry)
@@ -94,10 +136,10 @@ def load_model_data(folder, stage):
 
 
 def draw_kde_blob(ax, pts, color,
-                  bw=0.15,
+                  bw=SYSTEM_BW,
                   threshold=0.05,
-                  alpha_fill=0.20,
-                  grid_res=200j):
+                  alpha_fill=0.10,
+                  grid_res=300j):
     """
     Draw a tight filled boundary around a 2-D point cloud using KDE.
     bw        : bandwidth — smaller = tighter to points (0.05–0.3)
@@ -117,14 +159,14 @@ def draw_kde_blob(ax, pts, color,
     ax.contourf(xx, yy, density, levels=[level, density.max()],
                 colors=[color], alpha=alpha_fill, zorder=1)
     ax.contour(xx, yy, density, levels=[level],
-               colors=[color], linewidths=1.5, linestyles='--', alpha=0.8, zorder=1)
+               colors=[color], linewidths=1.5,  linestyle='--', dashes=(5, 1), alpha=0.8, zorder=1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main plot
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _compute_kde_grid(pts, bw=0.15, grid_res=300j,
+def _compute_kde_grid(pts, bw=SYSTEM_BW, grid_res=300j,
                       circle_cx=0.0, circle_cy=0.0, circle_r=None):
     """
     Compute a KDE density grid and mask everything outside the network circle
@@ -170,6 +212,24 @@ def _draw_circle(ax, cx, cy, r, **kwargs):
     ax.plot(cx + r * np.cos(theta), cy + r * np.sin(theta), **kwargs)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Vibrant colour palette
+# ─────────────────────────────────────────────────────────────────────────────
+# Just blue and orange — vivid, high-contrast, cycles if N_channels > 2.
+VIVID_HEX = [
+    "#2979FF",  # vivid blue
+    "#FF6D00",  # vivid orange
+]
+
+import matplotlib.colors as mcolors
+VIVID_RGB = [np.array(mcolors.to_rgb(h)) for h in VIVID_HEX]
+
+
+def vivid_color(c):
+    """Get the vivid hex colour for channel index c (cycles if c exceeds palette)."""
+    return VIVID_HEX[c % len(VIVID_HEX)]
+
+
 def _add_tx_rx(ax, all_data, N_channels, ch_cmap, dot_color=None):
     """Scatter transmitters and users on ax."""
     for data in all_data:
@@ -182,22 +242,23 @@ def _add_tx_rx(ax, all_data, N_channels, ch_cmap, dot_color=None):
                 col = ch_cmap[c % len(ch_cmap)]
             else:
                 col = ch_cmap(c)
-            ax.scatter(posT[c, 0], posT[c, 1],
-                       marker="^", color=col, s=150,
+            ax.scatter(1.1*posT[c, 0], 1.1*posT[c, 1],
+                       marker="^", color=col, s=1000,
                        zorder=5, edgecolors="k", linewidths=0.7)
             pu = posU[c] if isinstance(posU, list) else posU[c]
             if torch.is_tensor(pu):
                 pu = pu.numpy()
-            ax.scatter(pu[:, 0], pu[:, 1],
-                       marker="s", color=col, s=150,
+            ax.scatter(1.1*pu[:, 0], 1.1*pu[:, 1],
+                       marker="s", color=col, s=1000,
                        zorder=5, edgecolors="k", linewidths=0.7)
 
 
 
-def plot_blobs(prefix, stage=2, save_path=None):
-    folders = find_model_folders(prefix)
+def plot_blobs(prefix, stage=2, save_path=None, models_dir=None):
+    folders = find_model_folders(prefix, base=models_dir)
     if not folders:
-        print(f"No folders found matching prefix '{prefix}_<idx>'")
+        print(f"No folders found matching prefix '{prefix}_<idx>'"
+              f"{' in ' + models_dir if models_dir else ''}")
         return
 
     print(f"Found {len(folders)} model folders: "
@@ -219,7 +280,7 @@ def plot_blobs(prefix, stage=2, save_path=None):
 
     N_channels = all_data[0]["N_channels"]
     n_models   = len(all_data)
-    ch_cmap    = plt.get_cmap("tab10", N_channels)
+    ch_cmap    = lambda c: vivid_color(c)   # vivid hex colour per channel
 
     # ── network circle: relays are drawn uniformly inside radius R centred at
     #    origin; transmitters sit at R_user ≈ R * 1.1.  Estimate R from posR.
@@ -243,7 +304,7 @@ def plot_blobs(prefix, stage=2, save_path=None):
         if not ch_pts_all[c]:
             continue
         all_pts = np.concatenate(ch_pts_all[c], axis=0)
-        grid    = _compute_kde_grid(all_pts, bw=0.15,
+        grid    = _compute_kde_grid(all_pts, bw=SYSTEM_BW, grid_res=300j,
                                     circle_cx=circle_cx,
                                     circle_cy=circle_cy,
                                     circle_r=circle_r)
@@ -251,62 +312,21 @@ def plot_blobs(prefix, stage=2, save_path=None):
 
     global_vmax = max(np.nanmax(g[2]) for (g, _) in kde_grids.values())
 
+    # ── output directory: <models_dir or script dir>/<prefix>_results ────────
+    results_base = models_dir if models_dir else os.path.dirname(os.path.abspath(__file__))
+    results_dir  = os.path.join(results_base, prefix + "_results")
+    os.makedirs(results_dir, exist_ok=True)
+
     base_path = save_path if save_path else "relay_blobs.png"
     base, ext = os.path.splitext(base_path)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # FIGURE 1 — blob contour overview
-    # ══════════════════════════════════════════════════════════════════════════
-    fig1, ax1 = plt.subplots(figsize=(10, 9))
-    ax1.set_aspect("equal")
-    ax1.set_title(
-        f"Relay assignment blobs — {n_models} models, {N_channels} channels",
-        fontsize=12)
-    ax1.set_xlabel("x"); ax1.set_ylabel("y")
-    ax1.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
-
-    _draw_circle(ax1, circle_cx, circle_cy, circle_r,
-                 color="k", linewidth=1.2, linestyle="-", alpha=0.4, zorder=1)
-
-    for c, (grid_data, all_pts) in kde_grids.items():
-        xx, yy, density, _ = grid_data
-        ch_color = ch_cmap(c)
-        ax1.scatter(all_pts[:, 0], all_pts[:, 1],
-                    color=ch_color, alpha=0.25, s=18, zorder=2, linewidths=0)
-        level = np.nanmax(density) * 0.05
-        ax1.contourf(xx, yy, density, levels=[level, np.nanmax(density)],
-                     colors=[ch_color], alpha=0.20, zorder=1)
-        ax1.contour(xx, yy, density, levels=[level],
-                    colors=[ch_color], linewidths=1.5,
-                    linestyles='--', alpha=0.85, zorder=2)
-
-    _add_tx_rx(ax1, all_data, N_channels, ch_cmap)
-    ax1.legend(
-        handles=[mpatches.Patch(facecolor=ch_cmap(c), alpha=0.6,
-                                label=f"Ch {c}  "
-                                      f"({sum(len(p) for p in ch_pts_all[c])} assignments)")
-                 for c in range(N_channels)] +
-                [mpatches.Patch(color="none",
-                                label=f"▲=TX  ■=RX  ({n_models} models)")],
-        loc="upper left", fontsize=9, framealpha=0.8)
-    fig1.tight_layout()
-    p1 = f"{base}{ext}"
-    fig1.savefig(os.path.join(DEFAULT_PREFIX + "_results", p1), dpi=150, bbox_inches="tight")
-    print(f"Figure 1 (blobs) saved → {p1}")
-    plt.close(fig1)
+ 
 
     # ══════════════════════════════════════════════════════════════════════════
     # FIGURE 2 — all channels on one heatmap (RGBA composite, white background)
     # Each channel: fixed RGB colour, density drives alpha → stays bright
     # ══════════════════════════════════════════════════════════════════════════
-    ch_colors_rgb = [
-        np.array([0.12, 0.47, 0.71]),
-        np.array([0.90, 0.45, 0.10]),
-        np.array([0.17, 0.63, 0.17]),
-        np.array([0.84, 0.15, 0.16]),
-        np.array([0.58, 0.40, 0.74]),
-        np.array([0.55, 0.34, 0.29]),
-    ]
+    ch_colors_rgb = VIVID_RGB
 
     fig2, ax2 = plt.subplots(figsize=(10, 9))
     ax2.set_aspect("equal")
@@ -329,7 +349,10 @@ def plot_blobs(prefix, stage=2, save_path=None):
         rgb   = ch_colors_rgb[c % len(ch_colors_rgb)]
         d_norm = np.nan_to_num(density, nan=0.0)
         d_norm = (d_norm / global_vmax).clip(0, 1)
-        alpha_c = d_norm * 0.75
+        # gamma < 1 boosts mid/low density regions so colour reads vivid
+        # sooner instead of fading out to pale near the edges of each blob
+        d_boost = d_norm ** 0.55
+        alpha_c = d_boost * 0.90
         for ch_idx in range(3):
             canvas[:, :, ch_idx] = (
                 canvas[:, :, ch_idx] * (1 - alpha_c.T)
@@ -343,25 +366,19 @@ def plot_blobs(prefix, stage=2, save_path=None):
     ax2.imshow(canvas, origin="lower", extent=extent,
                aspect="equal", zorder=1, interpolation="bilinear")
     _draw_circle(ax2, circle_cx, circle_cy, circle_r,
-                 color="k", linewidth=1.5, linestyle="-", alpha=0.6, zorder=4)
+                 color="k", linewidth=1.5, linestyle=(0,(10,10)), alpha=0.6, zorder=4)
     _add_tx_rx(ax2, all_data, N_channels, ch_colors_rgb)
-    ax2.legend(
-        handles=[mpatches.Patch(
-                     facecolor=ch_colors_rgb[c % len(ch_colors_rgb)],
-                     label=f"Channel {c}")
-                 for c in range(N_channels)] +
-                [mpatches.Patch(color="none",
-                                label=f"▲=TX  ■=RX  ({n_models} models)")],
-        loc="upper left", fontsize=9, framealpha=0.9)
 
     fig2.tight_layout()
     p2 = f"{base}_density_combined{ext}"
-    fig2.savefig(os.path.join(DEFAULT_PREFIX + "_results", p2), dpi=150, bbox_inches="tight")
-    print(f"Figure 2 (combined density) saved → {p2}")
+    fig2.savefig(os.path.join(results_dir, p2), dpi=150, bbox_inches="tight")
+    print(f"Figure 2 (combined density) saved → {os.path.join(results_dir, p2)}")
     plt.close(fig2)
 
-    ch_seq_cmaps = ["Blues", "Oranges", "Greens", "Reds",
-                    "Purples", "YlOrBr", "GnBu",  "RdPu"]
+    ch_seq_cmaps = [
+        LinearSegmentedColormap.from_list(f"vivid_{c}", ["#FFFFFF", VIVID_HEX[c % len(VIVID_HEX)]])
+        for c in range(N_channels)
+    ]
 
     # ══════════════════════════════════════════════════════════════════════════
     # FIGURE 3 — one heatmap per channel (split subplots, shared colour scale)
@@ -386,7 +403,7 @@ def plot_blobs(prefix, stage=2, save_path=None):
         ax.set_facecolor("white")
 
         _draw_circle(ax, circle_cx, circle_cy, circle_r,
-                     color="k", linewidth=1.2, linestyle="-", alpha=0.5, zorder=3)
+                     color="k", linewidth=1.2, linestyle="--", alpha=0.5, zorder=3)
 
         if c not in kde_grids:
             ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
@@ -394,7 +411,7 @@ def plot_blobs(prefix, stage=2, save_path=None):
             continue
 
         (xx, yy, density, _), all_pts = kde_grids[c]
-        seq_cmap = plt.get_cmap(ch_seq_cmaps[c % len(ch_seq_cmaps)]).copy()
+        seq_cmap = ch_seq_cmaps[c % len(ch_seq_cmaps)]
         seq_cmap.set_bad(color="white", alpha=0)   # NaN outside circle = white
 
         im = ax.pcolormesh(xx, yy, density,
@@ -420,18 +437,11 @@ def plot_blobs(prefix, stage=2, save_path=None):
 
     fig3.tight_layout()
     p3 = f"{base}_density_split{ext}"
-    fig3.savefig(os.path.join(DEFAULT_PREFIX + "_results", p3), dpi=150, bbox_inches="tight")
-    print(f"Figure 3 (split density) saved → {p3}")
+    fig3.savefig(os.path.join(results_dir, p3), dpi=150, bbox_inches="tight")
+    print(f"Figure 3 (split density) saved → {os.path.join(results_dir, p3)}")
     plt.close(fig3)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Hard-coded configuration  (edit these when running on the server)
-# ─────────────────────────────────────────────────────────────────────────────
-
-DEFAULT_PREFIX    = "compare_networks"       # folder prefix  →  model_0, model_1, …
-DEFAULT_STAGE     = 2             # integer stage to load (2 = stage_2)
-DEFAULT_SAVE_PATH = "relay_blobs.png"
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -447,10 +457,14 @@ if __name__ == "__main__":
                         help=f"Stage number to load (default: {DEFAULT_STAGE})")
     parser.add_argument("--save",   default=DEFAULT_SAVE_PATH,
                         help=f"Output file path (default: {DEFAULT_SAVE_PATH})")
+    parser.add_argument("--models-dir", default=DEFAULT_MODELS_DIR,
+                        help="Directory containing the <prefix>_<idx> model "
+                             "folders (default: this script's directory)")
     args = parser.parse_args()
 
     plot_blobs(
-        prefix    = args.prefix,
-        stage     = args.stage,
-        save_path = args.save,
+        prefix     = args.prefix,
+        stage      = args.stage,
+        save_path  = args.save,
+        models_dir = args.models_dir,
     )

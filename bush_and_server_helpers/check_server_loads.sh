@@ -31,16 +31,8 @@ declare -a USABLE=()
 for NODE in "${NODES[@]}"; do
     RESULT=$(timeout 10 ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$MY_USER@$NODE" '
         # Check if I already have a job running on this node
-        MY_JOBS=$(ps -u '"$MY_USER"' -o pid=,pcpu=,pmem=,etime=,cmd= 2>/dev/null | grep -E "main\.py|evaluate_all_networks\.py|random_networks\.py|run_gpu_slot" | grep -v grep)
+        MY_JOBS=$(ps -u '"$MY_USER"' -o pid=,pcpu=,pmem=,etime=,stat=,cmd= 2>/dev/null | grep -E "main\.py|evaluate_all_networks\.py|random_networks\.py|run_gpu_slot" | grep -v grep)
         MY_JOBS_COUNT=$(echo "$MY_JOBS" | grep -c .)
-
-        if [ "$MY_JOBS_COUNT" -gt 0 ]; then
-            echo "SKIP|$MY_JOBS_COUNT job(s) running"
-            echo "$MY_JOBS" | while read -r line; do
-                echo "JOBLINE|$line"
-            done
-            exit 0
-        fi
 
         # GPU stats: avg utilization % and avg used memory MiB across all GPUs
         GPU_STATS=$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null)
@@ -61,6 +53,14 @@ for NODE in "${NODES[@]}"; do
         # Other users GPU memory usage (everyone, including yourself, in MiB)
         OTHER_MEM=$(nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits 2>/dev/null | awk "{sum+=\$1} END {print sum+0}")
 
+        if [ "$MY_JOBS_COUNT" -gt 0 ]; then
+            echo "SKIP|$MY_JOBS_COUNT job(s) running|$AVG_UTIL|$TOTAL_USED|$TOTAL_MEM|$N_GPU|$LOAD1|$N_CPU|$OTHER_MEM"
+            echo "$MY_JOBS" | while read -r line; do
+                echo "JOBLINE|$line"
+            done
+            exit 0
+        fi
+
         echo "OK|$AVG_UTIL|$TOTAL_USED|$TOTAL_MEM|$N_GPU|$LOAD1|$N_CPU|$OTHER_MEM"
     ' 2>/dev/null)
 
@@ -73,10 +73,20 @@ for NODE in "${NODES[@]}"; do
     STATUS=$(echo "$RESULT" | head -1 | cut -d'|' -f1)
 
     if [ "$STATUS" = "SKIP" ]; then
-        REASON=$(echo "$RESULT" | head -1 | cut -d'|' -f2)
+        FIRST_LINE=$(echo "$RESULT" | head -1)
+        REASON=$(echo "$FIRST_LINE" | cut -d'|' -f2)
+        S_AVG_UTIL=$(echo "$FIRST_LINE" | cut -d'|' -f3)
+        S_TOTAL_USED=$(echo "$FIRST_LINE" | cut -d'|' -f4)
+        S_TOTAL_MEM=$(echo "$FIRST_LINE" | cut -d'|' -f5)
+        S_N_GPU=$(echo "$FIRST_LINE" | cut -d'|' -f6)
+        S_LOAD1=$(echo "$FIRST_LINE" | cut -d'|' -f7)
+        S_N_CPU=$(echo "$FIRST_LINE" | cut -d'|' -f8)
+        S_OTHER_MEM=$(echo "$FIRST_LINE" | cut -d'|' -f9)
+
         echo ""
         echo "── $NODE: [SKIPPED] — $REASON ────────────────────────"
-        echo "  PID    %CPU  %MEM  ELAPSED   CMD"
+        echo "  GPUs=$S_N_GPU  avg_util=${S_AVG_UTIL}%  gpu_mem_used=${S_OTHER_MEM}MiB/${S_TOTAL_MEM}MiB  cpu_load(1m)=${S_LOAD1} (${S_N_CPU} cores)"
+        echo "  PID    %CPU  %MEM  ELAPSED   STAT  CMD"
         echo "$RESULT" | grep "^JOBLINE|" | sed 's/^JOBLINE|//' | while read -r jobline; do
             echo "  $jobline"
         done
