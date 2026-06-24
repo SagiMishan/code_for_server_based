@@ -36,7 +36,7 @@ def dB2lin(x):
     return torch.pow(10, torch.tensor(x) / 10)
 
 def rapp(A, A0=1, p=3):
-    A_mag = torch.abs(A)
+    A_mag = torch.abs(A).clamp(min=1e-8) 
     mag = A_mag / (1 + ((A_mag / A0) ** 2) ** p) ** (1 / (2 * p))
     return mag * A / (A_mag + 1e-9)
 # Define the full neural network
@@ -264,8 +264,8 @@ class Network_single_channel(nn.Module):
         lambda_w = 1
         lambda_b = 1
         # clamp prevents norm gradient exploding to NaN at exactly zero
-        w_norm = self.w.norm(2, dim=1, keepdim=True).clamp(min=1e-8)
-        b_norm = self.b.norm(2, dim=1, keepdim=True).clamp(min=1e-8)
+        w_norm = (self.w * self.w.conj()).real.sum(dim=1, keepdim=True).clamp(min=1e-8).sqrt()
+        b_norm = (self.b * self.b.conj()).real.sum(dim=1, keepdim=True).clamp(min=1e-8).sqrt()
         self.V = torch.clamp(1 - torch.exp(-lambda_w * w_norm - lambda_b * b_norm),max=1-1e-8,min=1e-8)
 
     def BER(self, bits, pred):

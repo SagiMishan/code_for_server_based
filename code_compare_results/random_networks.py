@@ -37,7 +37,7 @@ RANDOM_CLAIM_DIR = os.environ.get(
 MAIN_MODEL_BASE = "/home/dsi/mishans1/projects/code_for_server_based/simulation/compare_networks"
 
 orignal_Name_of_model = "compare_networks"
-N_networks = 10
+N_networks = 50
 SNR_basic_trainning = 50
 max_iteration = 5
 SNR_step = 1
@@ -56,6 +56,23 @@ print(f"[random_networks] Using per-process random seed: {_unique_seed}")
 
 
 # ── Claim helpers ──────────────────────────────────────────────────────────────
+def count_existing_random_selections(main_path, n_channels):
+    """Count how many random_selections subfolders already contain a finished stage_3 model."""
+    random_sel_path = os.path.join(main_path, "random_selections")
+    if not os.path.exists(random_sel_path):
+        return 0
+
+    count = 0
+    for name in os.listdir(random_sel_path):
+        sub_path = os.path.join(random_sel_path, name)
+        if not os.path.isdir(sub_path):
+            continue
+        python_models_path = os.path.join(sub_path, "models", "python")
+        # Check that all channels were saved for this selection
+        if all(os.path.exists(os.path.join(python_models_path, f"stage_3c{c}"))
+               for c in range(n_channels)):
+            count += 1
+    return count
 
 def try_claim_selection(idx: int, name: str) -> bool:
     """Atomically claim training of random selection `name` under model idx.
@@ -80,7 +97,16 @@ def mark_selection_done(idx: int, name: str) -> None:
     open(os.path.join(claim_path, "done.txt"), "w").close()
 
 
-def count_existing_random_selections(main_path, n_channels):
+def count_claimed_selections(idx: int) -> int:
+    """Count selections already claimed (both running and done) for this idx."""
+    claim_root = os.path.join(RANDOM_CLAIM_DIR, str(idx))
+    if not os.path.isdir(claim_root):
+        return 0
+    return sum(
+        1 for entry in os.listdir(claim_root)
+        if entry.endswith(".claim") and
+        os.path.isdir(os.path.join(claim_root, entry))
+    )
     """Count how many random_selections subfolders already contain a finished stage_3 model."""
     random_sel_path = os.path.join(main_path, "random_selections")
     if not os.path.exists(random_sel_path):
@@ -104,7 +130,8 @@ def process_one_idx(idx: int) -> None:
     Name_of_model = f"{orignal_Name_of_model}_{idx}"
     main_path = os.path.join(MAIN_MODEL_BASE, Name_of_model, "")
 
-    model = load_model(path=main_path).to(device)
+    # Load model once to get architecture info and max_snr_train
+    model_template = load_model(path=main_path)
     max_snr_train = torch.load(
         os.path.join(main_path, "data", "max_snr_train_stage_1"), weights_only=True)
 
@@ -112,10 +139,14 @@ def process_one_idx(idx: int) -> None:
     if not os.path.exists(random_sel_dir):
         os.makedirs(random_sel_dir)
 
-    n_existing = count_existing_random_selections(main_path, model.N_channels)
-    n_to_run   = max(0, N_networks - n_existing)
-    print(f"{Name_of_model}: found {n_existing} existing random selections, "
-          f"running {n_to_run} more")
+    n_existing = count_existing_random_selections(main_path, model_template.N_channels)
+    n_claimed  = count_claimed_selections(idx)
+    # n_claimed includes both running and done — use the higher of the two
+    # (disk count may lag behind claims if a run just finished writing)
+    n_accounted = max(n_existing, n_claimed)
+    n_to_run = max(0, N_networks - n_accounted)
+    print(f"{Name_of_model}: {n_existing} done on disk, {n_claimed} claimed "
+          f"(running+done) → running {n_to_run} more")
 
     completed_this_run = 0
     attempts   = 0
@@ -127,7 +158,9 @@ def process_one_idx(idx: int) -> None:
         attempts += 1
         start_time_1 = time.time()
 
-        model = load_model(path=main_path).to(device)
+        # Re-use the loaded model — just re-randomize P, no NFS reload needed
+        model = load_model(path=main_path)
+        model.to(device)   # ← move to GPU before any computation
         for c in range(model.N_channels):
             model.P[c] = torch.rand(model.P[c].shape)
 
@@ -170,7 +203,7 @@ def process_one_idx(idx: int) -> None:
             os.makedirs(os.path.join(path, "models", "matlab"))
             os.makedirs(os.path.join(path, "outputs"))
             os.makedirs(os.path.join(path, "data"))
-        # sys.stdout = open(os.devnull, 'w')
+        sys.stdout = open(os.devnull, 'w')
         try:
             stage_3(model=model,
                     SNR_basic_trainning=SNR_basic_trainning,
@@ -187,8 +220,8 @@ def process_one_idx(idx: int) -> None:
                 stage="stage_3")
             plt.close()
         finally:
-            # sys.stdout.close()
-            # sys.stdout = original_stdout
+            sys.stdout.close()
+            sys.stdout = original_stdout
             end_time_1 = time.time()
             timing_lines = [f"stage_3 took {_fmt(end_time_1 - start_time_1)} (hh:mm:ss)"]
             for line in timing_lines:

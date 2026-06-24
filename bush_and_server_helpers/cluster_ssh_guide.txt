@@ -15,13 +15,12 @@ ps aux | grep python
 
 # to setup the venv in the cpu and gpu
 conda activate relay_env
-cd /home/dsi/mishans1/projects/code_for_server_based
 
 # CPU venv
 python -m venv .venv_cpu
 conda deactivate
 source .venv_cpu/bin/activate
-pip install torch torchvision torchaudio matplotlib numpy
+pip install torch torchvision torchaudio matplotlib numpy pandas scipy
 deactivate
 
 # GPU venv
@@ -30,7 +29,7 @@ python -m venv .venv_gpu
 conda deactivate
 source .venv_gpu/bin/activate
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install matplotlib numpy scipy tqdm
+pip install matplotlib numpy scipy tqdm pandas
 deactivate
 
 

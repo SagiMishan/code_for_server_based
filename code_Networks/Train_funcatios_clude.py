@@ -298,7 +298,7 @@ def train_multy_channel(model, num_itr, loss_fn, optimizer, path, z0,
     snr_lin_low  = float(dB2lin(SNR))    # plain float — must not enter autograd graph
     snr_lin_high = float(dB2lin(SNR + 5))
     snr_log_lin  = float(dB2lin(SNR_log)) if SNR_log is not None else None
-
+    torch.autograd.set_detect_anomaly(True)
     for itr in range(num_itr):
         optimizer.zero_grad()
         loss = torch.tensor(0.0, dtype=torch.float, device=_device)
@@ -408,7 +408,7 @@ def train_multy_channel(model, num_itr, loss_fn, optimizer, path, z0,
 
             # ── per-channel metrics ───────────────────────────────────────────
             total_worst = 0.0
-            score_detach = score.detach()
+            score_detach = score
             v_ch_str = " | ".join("ch{} V={:.4f}".format(c, v_per_ch[c]) for c in range(C))
             out_string = "{:<2}/{} score={:.4f}  [{}]".format(li + 1, LOG, float(score_detach), v_ch_str)
 
